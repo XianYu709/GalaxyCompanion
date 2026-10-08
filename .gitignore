@@ -6,4 +6,5 @@ WearOS/.gradle/
 WearOS/build/
 WearOS/app/build/
 local.properties
-
+**/xcuserdata/
+*.xcuserstate

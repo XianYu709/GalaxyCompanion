@@ -10,7 +10,8 @@ let package = Package(
     products: [
         .library(name: "GalaxyCompanionProtocol", targets: ["GalaxyCompanionProtocol"]),
         .library(name: "GalaxyCompanionSync", targets: ["GalaxyCompanionSync"]),
-        .library(name: "GalaxyCompanionSimulator", targets: ["GalaxyCompanionSimulator"])
+        .library(name: "GalaxyCompanionSimulator", targets: ["GalaxyCompanionSimulator"]),
+        .library(name: "GalaxyCompanionHealth", targets: ["GalaxyCompanionHealth"])
     ],
     targets: [
         .target(name: "GalaxyCompanionProtocol"),
@@ -21,6 +22,10 @@ let package = Package(
         .target(
             name: "GalaxyCompanionSimulator",
             dependencies: ["GalaxyCompanionProtocol", "GalaxyCompanionSync"]
+        ),
+        .target(
+            name: "GalaxyCompanionHealth",
+            dependencies: ["GalaxyCompanionProtocol"]
         ),
         .testTarget(
             name: "GalaxyCompanionProtocolTests",
@@ -33,7 +38,10 @@ let package = Package(
                 "GalaxyCompanionSync",
                 "GalaxyCompanionSimulator"
             ]
+        ),
+        .testTarget(
+            name: "GalaxyCompanionHealthTests",
+            dependencies: ["GalaxyCompanionHealth", "GalaxyCompanionProtocol"]
         )
     ]
 )
-

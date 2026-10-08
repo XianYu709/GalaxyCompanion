@@ -1,5 +1,28 @@
 import Foundation
 
+enum WatchTransportMode: Equatable {
+    case hardware
+    case simulated
+
+    var title: String {
+        switch self {
+        case .hardware:
+            "真实 BLE 手表"
+        case .simulated:
+            "模拟手表"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .hardware:
+            "通过 GalaxyCompanion 自有 GATT 服务连接真实 Galaxy Watch。"
+        case .simulated:
+            "仅用于 iOS 模拟器中的界面与协议流程验证，不访问蓝牙硬件。"
+        }
+    }
+}
+
 /// Business-facing connection state. CoreBluetooth types never cross this boundary.
 enum WatchTransportState: Equatable {
     case waitingForBluetooth
@@ -50,7 +73,7 @@ enum WatchTransportState: Equatable {
         case .discoveringServices:
             "正在确认 GATT 服务和基础特征。"
         case .connected:
-            "连接链路已建立；能力协商与健康同步将在下一步接入。"
+            "连接链路、能力协商和基础健康同步通道均已就绪。"
         case .failed(let reason):
             reason
         case .stopped:
@@ -59,12 +82,27 @@ enum WatchTransportState: Equatable {
     }
 }
 
+/// Explicit business-level events for the basic-health GATT channel. These
+/// events never expose CoreBluetooth characteristic objects to the app layer.
+enum HealthSyncTransportEvent: Equatable {
+    case requestSent(afterCursor: Int64, requestID: UUID)
+    case batchReceived(HealthSyncBatch)
+    case failed(String)
+}
+
 @MainActor
 protocol WatchTransport: AnyObject {
+    var mode: WatchTransportMode { get }
     var state: WatchTransportState { get }
     var onStateChange: ((WatchTransportState) -> Void)? { get set }
+    var onCapabilitiesChange: ((WatchCapabilities) -> Void)? { get set }
+    var onHealthSyncEvent: ((HealthSyncTransportEvent) -> Void)? { get set }
 
     func startDiscovery()
     func stop()
+    func requestHealthSync(
+        requestID: UUID,
+        after cursor: Int64,
+        maximumSampleCount: UInt16
+    )
 }
-

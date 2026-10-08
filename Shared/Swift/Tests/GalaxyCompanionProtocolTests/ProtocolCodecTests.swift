@@ -32,5 +32,100 @@ final class ProtocolCodecTests: XCTestCase {
         XCTAssertTrue(decodedCapabilities.supports(.heartRate))
         XCTAssertFalse(decodedCapabilities.supports(.nfcHce))
     }
-}
 
+    func testDecodesCapabilitiesPayloadServedByWearGatt() throws {
+        let watchPayload = Data(
+            #"{"identity":{"model":"GalaxyCompanion Development Watch","wearOSVersion":"Wear OS","firmwareVersion":"0.1.0-debug"},"enabled":["heartRate","steps","calories","distance"],"healthDataMode":"developmentSynthetic"}"#.utf8
+        )
+
+        let decoded = try ProtocolCodec.decode(WatchCapabilities.self, from: watchPayload)
+
+        XCTAssertEqual(decoded.identity.model, "GalaxyCompanion Development Watch")
+        XCTAssertEqual(decoded.identity.wearOSVersion, "Wear OS")
+        XCTAssertEqual(decoded.enabled, [.heartRate, .steps, .calories, .distance])
+        XCTAssertEqual(decoded.healthDataMode, .developmentSynthetic)
+    }
+
+    func testGATTHealthSyncPacketsReassembleOutOfOrder() throws {
+        let payload = Data(repeating: 0x61, count: 73)
+        let rawPackets = try GATTHealthSyncPacketCodec.fragment(
+            payload: payload,
+            sequence: 42,
+            maximumPacketSize: 20
+        )
+        XCTAssertGreaterThan(rawPackets.count, 1)
+
+        var assembler = GATTHealthSyncPacketAssembler()
+        var completedPayload: Data?
+        for rawPacket in rawPackets.reversed() {
+            completedPayload = try assembler.append(
+                GATTHealthSyncPacketCodec.decode(rawPacket)
+            ) ?? completedPayload
+        }
+
+        XCTAssertEqual(completedPayload, payload)
+    }
+
+    func testRejectsIncompatibleGATTPacketVersion() throws {
+        XCTAssertThrowsError(try GATTHealthSyncPacketCodec.fragment(
+            payload: Data("{}".utf8),
+            protocolVersion: 2,
+            sequence: 1,
+            maximumPacketSize: 20
+        )) {
+            XCTAssertEqual($0 as? GATTHealthSyncPacketError, .incompatibleProtocolVersion(2))
+        }
+    }
+
+    func testRequestIdentifierRoundTrips() throws {
+        let request = HealthSyncRequest(
+            requestID: UUID(uuidString: "12345678-1234-1234-1234-123456789ABC")!,
+            afterCursor: 5,
+            maximumSampleCount: 20
+        )
+
+        XCTAssertEqual(
+            try ProtocolCodec.decode(HealthSyncRequest.self, from: ProtocolCodec.encode(request)),
+            request
+        )
+    }
+
+    func testRejectsReservedFlagsAndOversizedFragments() throws {
+        var packet = try GATTHealthSyncPacketCodec.fragment(
+            payload: Data("{}".utf8),
+            sequence: 1,
+            maximumPacketSize: 20
+        )[0]
+        packet[1] = 1
+
+        XCTAssertThrowsError(try GATTHealthSyncPacketCodec.decode(packet)) {
+            XCTAssertEqual($0 as? GATTHealthSyncPacketError, .reservedFlagsNonZero(1))
+        }
+
+        let excessiveFragmentCount = Data([
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 129
+        ])
+        XCTAssertThrowsError(try GATTHealthSyncPacketCodec.decode(excessiveFragmentCount)) {
+            XCTAssertEqual($0 as? GATTHealthSyncPacketError, .invalidFragmentRange)
+        }
+
+        XCTAssertThrowsError(try GATTHealthSyncPacketCodec.fragment(
+            payload: Data(repeating: 0, count: GATTHealthSyncPacketCodec.maximumReassembledPayloadBytes + 1),
+            sequence: 1,
+            maximumPacketSize: 20
+        )) {
+            XCTAssertEqual($0 as? GATTHealthSyncPacketError, .packetTooLarge)
+        }
+    }
+
+    func testRejectsNegativeSigned63BitSequence() throws {
+        XCTAssertThrowsError(try GATTHealthSyncPacketCodec.fragment(
+            payload: Data("{}".utf8),
+            sequence: -1,
+            maximumPacketSize: 20
+        )) {
+            XCTAssertEqual($0 as? GATTHealthSyncPacketError, .invalidSequence(-1))
+        }
+    }
+
+}

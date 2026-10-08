@@ -1,6 +1,10 @@
 import Foundation
+#if canImport(GalaxyCompanionProtocol)
 import GalaxyCompanionProtocol
+#endif
+#if canImport(GalaxyCompanionSync)
 import GalaxyCompanionSync
+#endif
 
 public actor FakeWatchSyncSource: WatchHealthSyncSource {
     private let advertisedCapabilities: WatchCapabilities
@@ -19,16 +23,15 @@ public actor FakeWatchSyncSource: WatchHealthSyncSource {
         samples.append(contentsOf: additionalSamples)
     }
 
-    public func nextBatch(after cursor: UInt64, maximumSampleCount: Int) -> HealthSyncBatch {
-        let startIndex = min(Int(cursor), samples.count)
+    public func nextBatch(after cursor: Int64, maximumSampleCount: Int) -> HealthSyncBatch {
+        let startIndex = cursor >= Int64(samples.count) ? samples.count : Int(cursor)
         let endIndex = min(startIndex + maximumSampleCount, samples.count)
         let nextSamples = Array(samples[startIndex..<endIndex])
 
         return HealthSyncBatch(
-            sequence: cursor + 1,
-            nextCursor: UInt64(endIndex),
+            sequence: cursor == Int64.max ? Int64.max : cursor + 1,
+            nextCursor: Int64(endIndex),
             samples: nextSamples
         )
     }
 }
-

@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -106,15 +108,19 @@ private fun GalaxyCompanionWatchApp(
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .verticalScroll(rememberScrollState())
                 .padding(12.dp),
-            verticalArrangement = Arrangement.Center,
+            verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text("GalaxyCompanion")
             Text("连接验证")
-            Spacer(Modifier.height(8.dp))
+            if (BuildConfig.DEBUG) {
+                Text("开发构建：仅可发送合成调试样本；未实现认证配对。")
+            } else {
+                Text("真实健康传输已禁用，等待认证配对设计与验证。")
+            }
             Text(status)
-            Spacer(Modifier.height(8.dp))
             Button(onClick = onStart) {
                 Text("启动 BLE")
             }
