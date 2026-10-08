@@ -1,0 +1,9 @@
+.DS_Store
+.swiftpm/
+.build/
+DerivedData/
+WearOS/.gradle/
+WearOS/build/
+WearOS/app/build/
+local.properties
+
