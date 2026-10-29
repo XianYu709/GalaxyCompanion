@@ -46,6 +46,21 @@ final class ProtocolCodecTests: XCTestCase {
         XCTAssertEqual(decoded.healthDataMode, .developmentSynthetic)
     }
 
+    func testDecodesGranularAggregationAndMigratesLegacyDailyTotals() throws {
+        let intervalPayload = Data(
+            #"{"id":"00112233-4455-6677-8899-aabbccddeeff","metric":"steps","value":42,"unit":"count","startTime":1700000000000,"endTime":1700000300000,"source":"wearHealthServices","quality":"measured","revision":4,"aggregation":"interval"}"#.utf8
+        )
+        let legacyDailyPayload = Data(
+            #"{"id":"00112233-4455-6677-8899-aabbccddeee0","metric":"distance","value":120,"unit":"meters","startTime":1700000000000,"endTime":1700000300000,"source":"wearHealthServices","quality":"measured","revision":4}"#.utf8
+        )
+
+        let interval = try ProtocolCodec.decode(HealthSample.self, from: intervalPayload)
+        let legacyDaily = try ProtocolCodec.decode(HealthSample.self, from: legacyDailyPayload)
+
+        XCTAssertEqual(interval.aggregation, .interval)
+        XCTAssertEqual(legacyDaily.aggregation, .dailyCumulative)
+    }
+
     func testGATTHealthSyncPacketsReassembleOutOfOrder() throws {
         let payload = Data(repeating: 0x61, count: 73)
         let rawPackets = try GATTHealthSyncPacketCodec.fragment(

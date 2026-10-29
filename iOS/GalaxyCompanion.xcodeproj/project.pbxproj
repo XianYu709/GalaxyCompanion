@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 56;
+	objectVersion = 60;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -11,19 +11,15 @@
 		A10000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000002 /* ContentView.swift */; };
 		A10000000000000000000003 /* WatchTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000004 /* WatchTransport.swift */; };
 		A10000000000000000000004 /* CoreBluetoothWatchTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000005 /* CoreBluetoothWatchTransport.swift */; };
-		A10000000000000000000005 /* DebugWatchTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000006 /* DebugWatchTransport.swift */; };
-		A10000000000000000000006 /* GalaxyCompanionProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = H10000000000000000000002 /* GalaxyCompanionProtocol */; };
-		A10000000000000000000007 /* DebugHealthSyncService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000007 /* DebugHealthSyncService.swift */; };
-		A10000000000000000000008 /* GalaxyCompanionSync in Frameworks */ = {isa = PBXBuildFile; productRef = H10000000000000000000003 /* GalaxyCompanionSync */; };
-		A10000000000000000000009 /* GalaxyCompanionSimulator in Frameworks */ = {isa = PBXBuildFile; productRef = H10000000000000000000004 /* GalaxyCompanionSimulator */; };
 		A10000000000000000000010 /* BLEHealthSyncService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000008 /* BLEHealthSyncService.swift */; };
 		A10000000000000000000011 /* HealthKitExportService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000009 /* HealthKitExportService.swift */; };
 		A10000000000000000000012 /* HealthKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* HealthKit.framework */; };
-		A10000000000000000000013 /* GalaxyCompanionHealth in Frameworks */ = {isa = PBXBuildFile; productRef = H10000000000000000000005 /* GalaxyCompanionHealth */; };
 		A10000000000000000000014 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000015 /* Models.swift */; };
 		A10000000000000000000015 /* Sync.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* Sync.swift */; };
-		A10000000000000000000016 /* FakeWatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000013 /* FakeWatch.swift */; };
 		A10000000000000000000017 /* HealthKitExportPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000014 /* HealthKitExportPolicy.swift */; };
+		A10000000000000000000018 /* AppDesign.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000016 /* AppDesign.swift */; };
+		A10000000000000000000019 /* HealthDashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000017 /* HealthDashboardView.swift */; };
+		A10000000000000000000020 /* SleepAnalysis.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000018 /* SleepAnalysis.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,16 +28,16 @@
 		B10000000000000000000003 /* GalaxyCompanion.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GalaxyCompanion.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B10000000000000000000004 /* WatchTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchTransport.swift; sourceTree = "<group>"; };
 		B10000000000000000000005 /* CoreBluetoothWatchTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreBluetoothWatchTransport.swift; sourceTree = "<group>"; };
-		B10000000000000000000006 /* DebugWatchTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugWatchTransport.swift; sourceTree = "<group>"; };
-		B10000000000000000000007 /* DebugHealthSyncService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugHealthSyncService.swift; sourceTree = "<group>"; };
 		B10000000000000000000008 /* BLEHealthSyncService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEHealthSyncService.swift; sourceTree = "<group>"; };
 		B10000000000000000000009 /* HealthKitExportService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthKitExportService.swift; sourceTree = "<group>"; };
 		B10000000000000000000010 /* HealthKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = HealthKit.framework; path = System/Library/Frameworks/HealthKit.framework; sourceTree = SDKROOT; };
-		B10000000000000000000015 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Models.swift; path = ../Shared/Swift/Sources/GalaxyCompanionProtocol/Models.swift; sourceTree = SOURCE_ROOT; };
-		B10000000000000000000012 /* Sync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Sync.swift; path = ../Shared/Swift/Sources/GalaxyCompanionSync/Sync.swift; sourceTree = SOURCE_ROOT; };
-		B10000000000000000000013 /* FakeWatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FakeWatch.swift; path = ../Shared/Swift/Sources/GalaxyCompanionSimulator/FakeWatch.swift; sourceTree = SOURCE_ROOT; };
-		B10000000000000000000014 /* HealthKitExportPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HealthKitExportPolicy.swift; path = ../Shared/Swift/Sources/GalaxyCompanionHealth/HealthKitExportPolicy.swift; sourceTree = SOURCE_ROOT; };
 		B10000000000000000000011 /* GalaxyCompanion.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = GalaxyCompanion.entitlements; sourceTree = "<group>"; };
+		B10000000000000000000012 /* Sync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Sync.swift; path = ../Shared/Swift/Sources/GalaxyCompanionSync/Sync.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000014 /* HealthKitExportPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HealthKitExportPolicy.swift; path = ../Shared/Swift/Sources/GalaxyCompanionHealth/HealthKitExportPolicy.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000015 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Models.swift; path = ../Shared/Swift/Sources/GalaxyCompanionProtocol/Models.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000016 /* AppDesign.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDesign.swift; sourceTree = "<group>"; };
+		B10000000000000000000017 /* HealthDashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthDashboardView.swift; sourceTree = "<group>"; };
+		B10000000000000000000018 /* SleepAnalysis.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SleepAnalysis.swift; path = ../Shared/Swift/Sources/GalaxyCompanionHealth/SleepAnalysis.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -49,11 +45,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A10000000000000000000006 /* GalaxyCompanionProtocol in Frameworks */,
-				A10000000000000000000008 /* GalaxyCompanionSync in Frameworks */,
-				A10000000000000000000009 /* GalaxyCompanionSimulator in Frameworks */,
 				A10000000000000000000012 /* HealthKit.framework in Frameworks */,
-				A10000000000000000000013 /* GalaxyCompanionHealth in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -74,35 +66,17 @@
 			children = (
 				B10000000000000000000001 /* GalaxyCompanionApp.swift */,
 				B10000000000000000000002 /* ContentView.swift */,
+				B10000000000000000000016 /* AppDesign.swift */,
+				B10000000000000000000017 /* HealthDashboardView.swift */,
 				B10000000000000000000011 /* GalaxyCompanion.entitlements */,
 				C10000000000000000000004 /* BLE */,
 				C10000000000000000000005 /* Health */,
 				B10000000000000000000015 /* Models.swift */,
 				B10000000000000000000012 /* Sync.swift */,
-				B10000000000000000000013 /* FakeWatch.swift */,
 				B10000000000000000000014 /* HealthKitExportPolicy.swift */,
+				B10000000000000000000018 /* SleepAnalysis.swift */,
 			);
 			path = GalaxyCompanion;
-			sourceTree = "<group>";
-		};
-		C10000000000000000000005 /* Health */ = {
-			isa = PBXGroup;
-			children = (
-				B10000000000000000000007 /* DebugHealthSyncService.swift */,
-				B10000000000000000000008 /* BLEHealthSyncService.swift */,
-				B10000000000000000000009 /* HealthKitExportService.swift */,
-			);
-			path = Health;
-			sourceTree = "<group>";
-		};
-		C10000000000000000000004 /* BLE */ = {
-			isa = PBXGroup;
-			children = (
-				B10000000000000000000004 /* WatchTransport.swift */,
-				B10000000000000000000005 /* CoreBluetoothWatchTransport.swift */,
-				B10000000000000000000006 /* DebugWatchTransport.swift */,
-			);
-			path = BLE;
 			sourceTree = "<group>";
 		};
 		C10000000000000000000003 /* Products */ = {
@@ -111,6 +85,24 @@
 				B10000000000000000000003 /* GalaxyCompanion.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		C10000000000000000000004 /* BLE */ = {
+			isa = PBXGroup;
+			children = (
+				B10000000000000000000004 /* WatchTransport.swift */,
+				B10000000000000000000005 /* CoreBluetoothWatchTransport.swift */,
+			);
+			path = BLE;
+			sourceTree = "<group>";
+		};
+		C10000000000000000000005 /* Health */ = {
+			isa = PBXGroup;
+			children = (
+				B10000000000000000000008 /* BLEHealthSyncService.swift */,
+				B10000000000000000000009 /* HealthKitExportService.swift */,
+			);
+			path = Health;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -130,10 +122,6 @@
 			);
 			name = GalaxyCompanion;
 			packageProductDependencies = (
-				H10000000000000000000002 /* GalaxyCompanionProtocol */,
-				H10000000000000000000003 /* GalaxyCompanionSync */,
-				H10000000000000000000004 /* GalaxyCompanionSimulator */,
-				H10000000000000000000005 /* GalaxyCompanionHealth */,
 			);
 			productName = GalaxyCompanion;
 			productReference = B10000000000000000000003 /* GalaxyCompanion.app */;
@@ -169,9 +157,6 @@
 			);
 			mainGroup = C10000000000000000000001;
 			productRefGroup = C10000000000000000000003 /* Products */;
-			packageReferences = (
-				H10000000000000000000001 /* XCLocalSwiftPackageReference "../Shared/Swift" */,
-			);
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -199,48 +184,18 @@
 				A10000000000000000000002 /* ContentView.swift in Sources */,
 				A10000000000000000000003 /* WatchTransport.swift in Sources */,
 				A10000000000000000000004 /* CoreBluetoothWatchTransport.swift in Sources */,
-				A10000000000000000000005 /* DebugWatchTransport.swift in Sources */,
-				A10000000000000000000007 /* DebugHealthSyncService.swift in Sources */,
 				A10000000000000000000010 /* BLEHealthSyncService.swift in Sources */,
 				A10000000000000000000011 /* HealthKitExportService.swift in Sources */,
 				A10000000000000000000014 /* Models.swift in Sources */,
 				A10000000000000000000015 /* Sync.swift in Sources */,
-				A10000000000000000000016 /* FakeWatch.swift in Sources */,
 				A10000000000000000000017 /* HealthKitExportPolicy.swift in Sources */,
+				A10000000000000000000018 /* AppDesign.swift in Sources */,
+				A10000000000000000000019 /* HealthDashboardView.swift in Sources */,
+				A10000000000000000000020 /* SleepAnalysis.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
-
-/* Begin XCLocalSwiftPackageReference section */
-		H10000000000000000000001 /* XCLocalSwiftPackageReference "../Shared/Swift" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = ../Shared/Swift;
-		};
-/* End XCLocalSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		H10000000000000000000002 /* GalaxyCompanionProtocol */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = H10000000000000000000001 /* XCLocalSwiftPackageReference "../Shared/Swift" */;
-			productName = GalaxyCompanionProtocol;
-		};
-		H10000000000000000000003 /* GalaxyCompanionSync */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = H10000000000000000000001 /* XCLocalSwiftPackageReference "../Shared/Swift" */;
-			productName = GalaxyCompanionSync;
-		};
-		H10000000000000000000004 /* GalaxyCompanionSimulator */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = H10000000000000000000001 /* XCLocalSwiftPackageReference "../Shared/Swift" */;
-			productName = GalaxyCompanionSimulator;
-		};
-		H10000000000000000000005 /* GalaxyCompanionHealth */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = H10000000000000000000001 /* XCLocalSwiftPackageReference "../Shared/Swift" */;
-			productName = GalaxyCompanionHealth;
-		};
-/* End XCSwiftPackageProductDependency section */
 
 /* Begin XCBuildConfiguration section */
 		G10000000000000000000003 /* Debug */ = {
@@ -277,16 +232,20 @@
 		G10000000000000000000005 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
 				CODE_SIGN_ENTITLEMENTS = GalaxyCompanion/GalaxyCompanion.entitlements;
+				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 8DQ9CB7XM6;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = GalaxyCompanion;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "GalaxyCompanion 使用蓝牙连接您安装了 GalaxyCompanion 的手表。";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "GalaxyCompanion 将把您同意的认证手表健康数据写入“健康”。";
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
 				MARKETING_VERSION = 0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.galaxycompanion.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -301,16 +260,20 @@
 		G10000000000000000000006 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
 				CODE_SIGN_ENTITLEMENTS = GalaxyCompanion/GalaxyCompanion.entitlements;
+				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 8DQ9CB7XM6;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = GalaxyCompanion;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "GalaxyCompanion 使用蓝牙连接您安装了 GalaxyCompanion 的手表。";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "GalaxyCompanion 将把您同意的认证手表健康数据写入“健康”。";
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
 				MARKETING_VERSION = 0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.galaxycompanion.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -345,6 +308,7 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
 	};
 	rootObject = F10000000000000000000001 /* Project object */;
 }

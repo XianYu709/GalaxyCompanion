@@ -39,15 +39,26 @@ public struct WatchCapabilities: Codable, Equatable, Sendable {
     /// ever be considered outside a development environment. This is a
     /// disclosure label, not an authentication claim.
     public let healthDataMode: HealthDataMode
+    /// Watch-private cached samples currently available for an authenticated
+    /// manual pull. This is a diagnostic count, never health data itself.
+    /// `nil` means an older Watch app did not disclose the count.
+    public let localHealthSampleCount: Int?
+    /// Whether the Watch has a persisted Health Services passive-recording
+    /// registration. It does not promise a particular callback cadence.
+    public let isLocalHealthRecordingEnabled: Bool?
 
     public init(
         identity: WatchIdentity,
         enabled: Set<WatchCapability>,
-        healthDataMode: HealthDataMode = .unavailable
+        healthDataMode: HealthDataMode = .unavailable,
+        localHealthSampleCount: Int? = nil,
+        isLocalHealthRecordingEnabled: Bool? = nil
     ) {
         self.identity = identity
         self.enabled = enabled
         self.healthDataMode = healthDataMode
+        self.localHealthSampleCount = localHealthSampleCount
+        self.isLocalHealthRecordingEnabled = isLocalHealthRecordingEnabled
     }
 
     public func supports(_ capability: WatchCapability) -> Bool {
@@ -58,6 +69,8 @@ public struct WatchCapabilities: Codable, Equatable, Sendable {
         case identity
         case enabled
         case healthDataMode
+        case localHealthSampleCount
+        case isLocalHealthRecordingEnabled
     }
 
     /// Missing disclosure metadata is deliberately treated as unavailable so
@@ -68,12 +81,18 @@ public struct WatchCapabilities: Codable, Equatable, Sendable {
         enabled = try container.decode(Set<WatchCapability>.self, forKey: .enabled)
         healthDataMode = try container.decodeIfPresent(HealthDataMode.self, forKey: .healthDataMode)
             ?? .unavailable
+        let disclosedCount = try container.decodeIfPresent(Int.self, forKey: .localHealthSampleCount)
+        localHealthSampleCount = disclosedCount.flatMap { $0 >= 0 ? $0 : nil }
+        isLocalHealthRecordingEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .isLocalHealthRecordingEnabled
+        )
     }
 }
 
 /// Transport disclosure for health values. `authenticatedMeasurement` is
-/// reserved until an authenticated pairing protocol is implemented and
-/// verified; this repository does not currently produce it.
+/// only valid for the current GATT connection after its protected pairing-gate
+/// read succeeds; it is neither a global device identity nor a HealthKit grant.
 public enum HealthDataMode: String, Codable, Equatable, Sendable {
     case unavailable
     case developmentSynthetic
@@ -86,6 +105,10 @@ public enum HealthMetric: String, CaseIterable, Codable, Sendable {
     case ibi
     case hrv
     case activeCalories
+    /// Total daily energy reported by Wear OS `CALORIES_DAILY`. It can include
+    /// basal energy, so it is deliberately distinct from `activeCalories`.
+    /// The iOS HealthKit policy rejects it rather than relabelling it.
+    case totalCalories
     case distance
     case floors
     case spo2
@@ -124,6 +147,33 @@ public enum SampleQuality: String, Codable, Sendable {
     case unreliable
 }
 
+/// Describes how a health value relates to time. This is intentionally part
+/// of the wire model: a daily total and a per-interval delta can use the same
+/// unit and metric name, but treating one as the other would either double
+/// count Apple Health data or create a false activity timeline for sleep
+/// analysis.
+public enum HealthSampleAggregation: String, Codable, Equatable, Sendable {
+    /// A point-in-time observation, such as heart rate in beats per minute.
+    case instantaneous
+    /// A value accrued only during the supplied start/end interval, such as
+    /// passive `STEPS` or `DISTANCE` deltas from Health Services.
+    case interval
+    /// A running total that resets on the Watch's own daily boundary, such as
+    /// `STEPS_DAILY` or `DISTANCE_DAILY`.
+    case dailyCumulative
+
+    static func legacyDefault(for metric: HealthMetric) -> HealthSampleAggregation {
+        switch metric {
+        case .steps, .distance, .totalCalories:
+            // Before this field existed, the Watch emitted only daily values
+            // for these metrics. Preserve that interpretation during decode.
+            .dailyCumulative
+        default:
+            .instantaneous
+        }
+    }
+}
+
 public struct HealthSample: Codable, Equatable, Sendable, Identifiable {
     public let id: UUID
     public let metric: HealthMetric
@@ -133,6 +183,14 @@ public struct HealthSample: Codable, Equatable, Sendable, Identifiable {
     public let endTime: Date?
     public let source: HealthSampleSource
     public let quality: SampleQuality
+    /// Monotonically increases when the Watch corrects a sample while keeping
+    /// its stable UUID. `0` preserves compatibility with batches emitted
+    /// before correction revisions were added.
+    public let revision: Int64
+    /// Whether this is a point, an interval delta, or a Watch-local daily
+    /// total. New writers must always send it; absent legacy data is decoded
+    /// conservatively via `HealthSampleAggregation.legacyDefault(for:)`.
+    public let aggregation: HealthSampleAggregation
 
     public init(
         id: UUID = UUID(),
@@ -142,7 +200,9 @@ public struct HealthSample: Codable, Equatable, Sendable, Identifiable {
         startTime: Date,
         endTime: Date? = nil,
         source: HealthSampleSource,
-        quality: SampleQuality
+        quality: SampleQuality,
+        revision: Int64 = 0,
+        aggregation: HealthSampleAggregation? = nil
     ) {
         self.id = id
         self.metric = metric
@@ -152,6 +212,27 @@ public struct HealthSample: Codable, Equatable, Sendable, Identifiable {
         self.endTime = endTime
         self.source = source
         self.quality = quality
+        self.revision = revision
+        self.aggregation = aggregation ?? HealthSampleAggregation.legacyDefault(for: metric)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, metric, value, unit, startTime, endTime, source, quality, revision, aggregation
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        metric = try container.decode(HealthMetric.self, forKey: .metric)
+        value = try container.decode(Double.self, forKey: .value)
+        unit = try container.decode(HealthUnit.self, forKey: .unit)
+        startTime = try container.decode(Date.self, forKey: .startTime)
+        endTime = try container.decodeIfPresent(Date.self, forKey: .endTime)
+        source = try container.decode(HealthSampleSource.self, forKey: .source)
+        quality = try container.decode(SampleQuality.self, forKey: .quality)
+        revision = try container.decodeIfPresent(Int64.self, forKey: .revision) ?? 0
+        aggregation = try container.decodeIfPresent(HealthSampleAggregation.self, forKey: .aggregation)
+            ?? HealthSampleAggregation.legacyDefault(for: metric)
     }
 }
 

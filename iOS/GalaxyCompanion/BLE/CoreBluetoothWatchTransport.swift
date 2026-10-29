@@ -10,20 +10,24 @@ final class CoreBluetoothWatchTransport: NSObject, WatchTransport {
         static let capabilities = CBUUID(string: "2B0D0002-4F31-4BB2-8F63-891BB1BD0001")
         static let syncControl = CBUUID(string: "2B0D0003-4F31-4BB2-8F63-891BB1BD0001")
         static let syncData = CBUUID(string: "2B0D0004-4F31-4BB2-8F63-891BB1BD0001")
+        static let pairingGate = CBUUID(string: "2B0D0005-4F31-4BB2-8F63-891BB1BD0001")
+        static let pairingGatePayload = Data([0x47, 0x43, 0x50, 0x01, 0x01])
     }
 
     private var centralManager: CBCentralManager!
     private var candidate: CBPeripheral?
+    private var capabilitiesCharacteristic: CBCharacteristic?
     private var syncControlCharacteristic: CBCharacteristic?
     private var syncDataCharacteristic: CBCharacteristic?
+    private var pairingGateCharacteristic: CBCharacteristic?
     private var syncDataNotificationsEnabled = false
     private var syncPacketAssembler = GATTHealthSyncPacketAssembler()
     private var healthSyncRequestInFlight = false
     private var expectedHealthSyncRequestID: UUID?
     private var shouldDiscover = false
-    // Kept false until an authenticated pairing/session design exists and has
-    // been verified on physical devices. BLE connection alone is not trust.
-    private let physicalHealthTransferEnabled = false
+    // The value is only set after the Watch has re-read its per-connection
+    // capabilities following the protected GATT pairing-gate read.
+    private var currentHealthDataMode: HealthDataMode = .unavailable
 
     let mode: WatchTransportMode = .hardware
 
@@ -33,7 +37,12 @@ final class CoreBluetoothWatchTransport: NSObject, WatchTransport {
 
     var onStateChange: ((WatchTransportState) -> Void)?
     var onCapabilitiesChange: ((WatchCapabilities) -> Void)?
+    var onPairingStatusChange: ((WatchPairingStatus) -> Void)?
     var onHealthSyncEvent: ((HealthSyncTransportEvent) -> Void)?
+
+    private(set) var pairingStatus: WatchPairingStatus = .notChecked {
+        didSet { onPairingStatusChange?(pairingStatus) }
+    }
 
     override init() {
         super.init()
@@ -57,17 +66,38 @@ final class CoreBluetoothWatchTransport: NSObject, WatchTransport {
             centralManager.cancelPeripheralConnection(candidate)
         }
         self.candidate = nil
+        capabilitiesCharacteristic = nil
         syncControlCharacteristic = nil
         syncDataCharacteristic = nil
+        pairingGateCharacteristic = nil
         syncDataNotificationsEnabled = false
         syncPacketAssembler.reset()
+        pairingStatus = .notChecked
+        currentHealthDataMode = .unavailable
         state = .stopped
     }
 
+    func requestSystemPairing() {
+        guard case .connected = state,
+              let candidate,
+              let pairingGateCharacteristic else {
+            pairingStatus = .failed("请先连接 Watch 并完成 GATT 特征发现。")
+            return
+        }
+        pairingStatus = .requestingSystemPairing
+        candidate.readValue(for: pairingGateCharacteristic)
+    }
+
     func requestHealthSync(requestID: UUID, after cursor: Int64, maximumSampleCount: UInt16) {
-        guard physicalHealthTransferEnabled else {
+        guard pairingStatus == .trustedForCurrentConnection else {
             onHealthSyncEvent?(
-                .failed("真实手表健康传输已禁用：认证配对尚未设计并验证。")
+                .failed("请先完成当前 BLE 连接的系统安全配对验证。")
+            )
+            return
+        }
+        guard currentHealthDataMode == .authenticatedMeasurement else {
+            onHealthSyncEvent?(
+                .failed("Watch 尚未在当前受保护连接上确认可传输健康数据。请完成配对后再次验证。")
             )
             return
         }
@@ -114,10 +144,14 @@ final class CoreBluetoothWatchTransport: NSObject, WatchTransport {
         }
 
         candidate = nil
+        capabilitiesCharacteristic = nil
         syncControlCharacteristic = nil
         syncDataCharacteristic = nil
+        pairingGateCharacteristic = nil
         syncDataNotificationsEnabled = false
         syncPacketAssembler.reset()
+        pairingStatus = .notChecked
+        currentHealthDataMode = .unavailable
         failPendingHealthSync("无法建立与手表的 BLE 连接。")
         centralManager.stopScan()
         centralManager.scanForPeripherals(
@@ -185,10 +219,14 @@ extension CoreBluetoothWatchTransport: @preconcurrency CBCentralManagerDelegate 
         error: Error?
     ) {
         candidate = nil
+        capabilitiesCharacteristic = nil
         syncControlCharacteristic = nil
         syncDataCharacteristic = nil
+        pairingGateCharacteristic = nil
         syncDataNotificationsEnabled = false
         syncPacketAssembler.reset()
+        pairingStatus = .notChecked
+        currentHealthDataMode = .unavailable
         failPendingHealthSync(error?.localizedDescription ?? "无法建立与手表的 BLE 连接。")
         state = .failed(error?.localizedDescription ?? "无法建立与手表的 BLE 连接。")
     }
@@ -199,10 +237,14 @@ extension CoreBluetoothWatchTransport: @preconcurrency CBCentralManagerDelegate 
         error: Error?
     ) {
         candidate = nil
+        capabilitiesCharacteristic = nil
         syncControlCharacteristic = nil
         syncDataCharacteristic = nil
+        pairingGateCharacteristic = nil
         syncDataNotificationsEnabled = false
         syncPacketAssembler.reset()
+        pairingStatus = .notChecked
+        currentHealthDataMode = .unavailable
         failPendingHealthSync(error?.localizedDescription ?? "手表连接已断开。")
         if shouldDiscover {
             beginScanIfPossible()
@@ -225,7 +267,7 @@ extension CoreBluetoothWatchTransport: @preconcurrency CBPeripheralDelegate {
             return
         }
         peripheral.discoverCharacteristics(
-            [Contract.capabilities, Contract.syncControl, Contract.syncData],
+            [Contract.capabilities, Contract.syncControl, Contract.syncData, Contract.pairingGate],
             for: service
         )
     }
@@ -242,16 +284,18 @@ extension CoreBluetoothWatchTransport: @preconcurrency CBPeripheralDelegate {
         }
 
         let discovered = Set(characteristics.map(\.uuid))
-        let required: Set<CBUUID> = [Contract.capabilities, Contract.syncControl, Contract.syncData]
+        let required: Set<CBUUID> = [Contract.capabilities, Contract.syncControl, Contract.syncData, Contract.pairingGate]
         guard required.isSubset(of: discovered) else {
             failPendingHealthSync("Watch GATT 服务缺少 GalaxyCompanion 协议所需特征。")
             state = .failed("Watch GATT 服务缺少 GalaxyCompanion 协议所需特征。")
             return
         }
 
+        capabilitiesCharacteristic = characteristics.first(where: { $0.uuid == Contract.capabilities })
         syncControlCharacteristic = characteristics.first(where: { $0.uuid == Contract.syncControl })
         syncDataCharacteristic = characteristics.first(where: { $0.uuid == Contract.syncData })
-        guard let capabilitiesCharacteristic = characteristics.first(where: { $0.uuid == Contract.capabilities }) else {
+        pairingGateCharacteristic = characteristics.first(where: { $0.uuid == Contract.pairingGate })
+        guard let capabilitiesCharacteristic else {
             failPendingHealthSync("Watch GATT 服务未返回能力特征。")
             state = .failed("Watch GATT 服务未返回能力特征。")
             return
@@ -264,6 +308,29 @@ extension CoreBluetoothWatchTransport: @preconcurrency CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        if characteristic.uuid == Contract.pairingGate {
+            guard error == nil, let value = characteristic.value else {
+                pairingStatus = .failed(
+                    "系统配对校验未通过：\(error?.localizedDescription ?? "未收到受保护特征")。完成蓝牙配对后可重试。"
+                )
+                return
+            }
+            guard value == Contract.pairingGatePayload else {
+                pairingStatus = .failed("Watch 返回的配对校验版本不兼容。")
+                return
+            }
+            pairingStatus = .trustedForCurrentConnection
+            // The Watch's capability disclosure is connection-scoped. It is
+            // deliberately read again only after the protected attribute
+            // succeeds; a pre-pairing read remains `.unavailable`.
+            if let capabilitiesCharacteristic {
+                peripheral.readValue(for: capabilitiesCharacteristic)
+            } else {
+                pairingStatus = .failed("Watch 未保留能力特征，无法确认当前连接的数据权限。")
+            }
+            return
+        }
+
         if characteristic.uuid == Contract.capabilities {
             guard error == nil, let value = characteristic.value else {
                 failPendingHealthSync(error?.localizedDescription ?? "无法读取 Watch 能力信息。")
@@ -273,12 +340,21 @@ extension CoreBluetoothWatchTransport: @preconcurrency CBPeripheralDelegate {
 
             do {
                 let capabilities = try ProtocolCodec.decode(WatchCapabilities.self, from: value)
+                currentHealthDataMode = capabilities.healthDataMode
                 onCapabilitiesChange?(capabilities)
-                if let syncDataCharacteristic {
-                    peripheral.setNotifyValue(true, for: syncDataCharacteristic)
-                } else {
+                guard let syncDataCharacteristic else {
                     failPendingHealthSync("Watch GATT 服务未返回健康同步数据特征。")
                     state = .failed("Watch GATT 服务未返回健康同步数据特征。")
+                    return
+                }
+                // The protected pairing gate deliberately triggers a second
+                // capabilities read. By then the notification subscription
+                // is normally already active; that is a healthy state, not
+                // an absent sync characteristic. Re-subscribing or failing
+                // here used to make a successfully paired connection look
+                // unavailable immediately before the first manual pull.
+                if !syncDataNotificationsEnabled {
+                    peripheral.setNotifyValue(true, for: syncDataCharacteristic)
                 }
             } catch {
                 failPendingHealthSync("Watch 能力信息格式无效：\(error.localizedDescription)")
@@ -290,6 +366,11 @@ extension CoreBluetoothWatchTransport: @preconcurrency CBPeripheralDelegate {
         guard characteristic.uuid == Contract.syncData else { return }
         guard error == nil, let value = characteristic.value else {
             failPendingHealthSync(error?.localizedDescription ?? "未收到完整的健康同步数据。")
+            return
+        }
+        guard pairingStatus == .trustedForCurrentConnection,
+              currentHealthDataMode == .authenticatedMeasurement else {
+            failPendingHealthSync("未通过当前连接的安全配对与能力校验，已拒绝健康同步数据。")
             return
         }
 
@@ -310,6 +391,12 @@ extension CoreBluetoothWatchTransport: @preconcurrency CBPeripheralDelegate {
             healthSyncRequestInFlight = false
             expectedHealthSyncRequestID = nil
             onHealthSyncEvent?(.batchReceived(batch))
+            // A manual pull may have drained every Watch-private sample. Ask
+            // for fresh diagnostics after the terminal page so the iPhone can
+            // explain the next manual sync instead of showing a stale count.
+            if batch.samples.isEmpty, let capabilitiesCharacteristic {
+                peripheral.readValue(for: capabilitiesCharacteristic)
+            }
         } catch {
             failPendingHealthSync("健康同步数据格式无效：\(error.localizedDescription)")
         }

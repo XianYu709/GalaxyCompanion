@@ -120,6 +120,10 @@ public enum AppleHealthSampleMapper {
             mapping = (.heartRate, .countPerMinute, .beatsPerMinute)
         case .activeCalories:
             mapping = (.activeEnergyBurned, .kilocalorie, .kilocalories)
+        case .totalCalories:
+            // Wear OS `CALORIES_DAILY` is not an active-energy measurement.
+            // Do not write it as `HKQuantityTypeIdentifierActiveEnergyBurned`.
+            return .failure(.unsupportedMetric(sample.metric))
         case .distance:
             mapping = (.distanceWalkingRunning, .meter, .meters)
         case .floors:
@@ -150,7 +154,10 @@ public enum AppleHealthSampleMapper {
         let canonicalID = sample.id.uuidString.lowercased()
         let metadata = AppleHealthSampleMetadata(
             syncIdentifier: "com.galaxycompanion.health.sample.\(canonicalID)",
-            syncVersion: 1,
+            // Apple Health uses the sync identifier/version pair to replace a
+            // corrected value without creating a second measurement. Revision
+            // 0 is legacy pre-revision wire data, so it remains version 1.
+            syncVersion: Int(min(max(sample.revision, 1), Int64(Int.max))),
             externalUUID: canonicalID,
             source: "GalaxyCompanion.\(sample.source.rawValue)"
         )
@@ -172,10 +179,183 @@ public enum AppleHealthSampleMapper {
         case .spo2:
             // HealthKit percent quantities use fractional values, not 0...100.
             return value > 0 && value <= 1
-        case .steps, .heartRate, .activeCalories, .distance, .floors, .bodyTemperature:
+        case .steps, .heartRate, .activeCalories, .totalCalories, .distance, .floors, .bodyTemperature:
             return value > 0
         case .skinTemperature, .ibi, .hrv, .respiratoryRate:
             return value > 0
+        }
+    }
+}
+
+/// A removal request for one previously-derived daily cumulative interval.
+/// The id and sync identifier deliberately match the later raw Watch sample
+/// that originally identified the derived interval. The iOS adapter may
+/// delete only its own object with this exact identifier and quantity type.
+public struct AppleHealthCumulativeRemoval: Equatable, Sendable, Identifiable {
+    public let id: UUID
+    public let quantityType: AppleHealthQuantityType
+    public let syncIdentifier: String
+    public let revision: Int64
+
+    public init(
+        id: UUID,
+        quantityType: AppleHealthQuantityType,
+        syncIdentifier: String,
+        revision: Int64
+    ) {
+        self.id = id
+        self.quantityType = quantityType
+        self.syncIdentifier = syncIdentifier
+        self.revision = revision
+    }
+}
+
+/// A normalized cumulative export pass. `samples` are safe new/replacement
+/// values; `removals` are intervals which a newer Watch correction made zero
+/// or negative and therefore must no longer remain in Apple Health.
+public struct AppleHealthCumulativeExportPlan: Equatable, Sendable {
+    public let samples: [HealthSample]
+    public let removals: [AppleHealthCumulativeRemoval]
+
+    public init(samples: [HealthSample], removals: [AppleHealthCumulativeRemoval]) {
+        self.samples = samples
+        self.removals = removals
+    }
+}
+
+/// Converts cumulative daily readings into non-overlapping HealthKit quantity
+/// intervals. Wear OS `STEPS_DAILY` and `DISTANCE_DAILY` are snapshots from
+/// the beginning of a day, not independent interval measurements. Exporting
+/// each raw snapshot would double count. Each derived value therefore uses
+/// the delta from the immediately preceding snapshot in the same daily
+/// series. The later raw sample's stable UUID identifies the derived interval
+/// and the maximum revision lets a corrected baseline replace the interval
+/// through HealthKit's sync identifier/version metadata.
+public enum AppleHealthCumulativeNormalizer {
+    /// Returns both positive values and corrections which invalidate a
+    /// previously exported interval. Callers that only need a display/export
+    /// candidate list may use `exportableSamples(from:)`, but production
+    /// HealthKit writers must consume the full plan so an old positive delta
+    /// cannot survive a later Watch correction to zero or below.
+    public static func exportPlan(from samples: [HealthSample]) -> AppleHealthCumulativeExportPlan {
+        let cumulative = samples.filter {
+            ($0.metric == .steps || $0.metric == .distance) &&
+                $0.aggregation == .dailyCumulative
+        }
+        // `CALORIES_DAILY` includes basal metabolism. It remains an in-app
+        // display value and is intentionally omitted before any HealthKit
+        // adapter sees it; the mapper also rejects it as a second guard.
+        let passthrough = samples.filter {
+            $0.metric != .totalCalories &&
+                !($0.aggregation == .dailyCumulative && ($0.metric == .steps || $0.metric == .distance))
+        }
+
+        let grouped = Dictionary(grouping: cumulative, by: DailySeriesKey.init)
+        let normalized = grouped.values.map(normalizeDailySeries)
+        let sortedSamples = (passthrough + normalized.flatMap(\.samples)).sorted { left, right in
+            if left.startTime != right.startTime { return left.startTime < right.startTime }
+            return left.id.uuidString < right.id.uuidString
+        }
+        return AppleHealthCumulativeExportPlan(
+            samples: sortedSamples,
+            removals: normalized.flatMap(\.removals).sorted { $0.id.uuidString < $1.id.uuidString }
+        )
+    }
+
+    public static func exportableSamples(from samples: [HealthSample]) -> [HealthSample] {
+        exportPlan(from: samples).samples
+    }
+
+    private static func normalizeDailySeries(_ source: [HealthSample]) -> AppleHealthCumulativeExportPlan {
+        let ordered = source.sorted { left, right in
+            let leftEnd = left.endTime ?? left.startTime
+            let rightEnd = right.endTime ?? right.startTime
+            if leftEnd != rightEnd { return leftEnd < rightEnd }
+            if left.revision != right.revision { return left.revision < right.revision }
+            return left.id.uuidString < right.id.uuidString
+        }
+
+        var previous: HealthSample?
+        var output: [HealthSample] = []
+        var removals: [AppleHealthCumulativeRemoval] = []
+        for sample in ordered {
+            let end = sample.endTime ?? sample.startTime
+            guard end >= sample.startTime else {
+                // Preserve an invalid input so the mapper can reject it with
+                // its ordinary, user-reportable validation error.
+                output.append(sample)
+                previous = sample
+                continue
+            }
+
+            let baseline = previous?.value ?? 0
+            let delta = sample.value - baseline
+            let intervalStart = previous.map { $0.endTime ?? $0.startTime } ?? sample.startTime
+            let revision = max(sample.revision, previous?.revision ?? 0)
+            if delta > 0, intervalStart <= end {
+                output.append(
+                    HealthSample(
+                        id: sample.id,
+                        metric: sample.metric,
+                        value: delta,
+                        unit: sample.unit,
+                        startTime: intervalStart,
+                        endTime: end,
+                        source: sample.source,
+                        quality: sample.quality,
+                        revision: revision,
+                        aggregation: .interval
+                    )
+                )
+            } else if intervalStart <= end, previous != nil {
+                // This exact stable id represented a positive interval on a
+                // prior export pass. A correction can make its delta zero or
+                // negative; silently omitting it would leave the former
+                // quantity in HealthKit and overcount the day. The platform
+                // adapter handles this as a narrowly-scoped app-owned delete.
+                removals.append(
+                    AppleHealthCumulativeRemoval(
+                        id: sample.id,
+                        quantityType: quantityType(for: sample.metric),
+                        syncIdentifier: syncIdentifier(for: sample.id),
+                        revision: revision
+                    )
+                )
+            }
+            // A reset/decrease emits no negative HealthKit quantity but still
+            // becomes the baseline for the next snapshot in this daily series.
+            previous = sample
+        }
+        return AppleHealthCumulativeExportPlan(samples: output, removals: removals)
+    }
+
+    private static func quantityType(for metric: HealthMetric) -> AppleHealthQuantityType {
+        switch metric {
+        case .steps: .stepCount
+        case .distance: .distanceWalkingRunning
+        default:
+            preconditionFailure("Only cumulative step and distance samples reach this path")
+        }
+    }
+
+    private static func syncIdentifier(for id: UUID) -> String {
+        "com.galaxycompanion.health.sample.\(id.uuidString.lowercased())"
+    }
+
+    private struct DailySeriesKey: Hashable {
+        let metric: HealthMetric
+        let unit: HealthUnit
+        let source: HealthSampleSource
+        let dayStart: Date
+
+        init(_ sample: HealthSample) {
+            metric = sample.metric
+            unit = sample.unit
+            source = sample.source
+            // Health Services supplies this start boundary for its daily
+            // aggregates. Keeping the precise value avoids making a later
+            // iPhone time-zone change alter the stable grouping.
+            dayStart = sample.startTime
         }
     }
 }

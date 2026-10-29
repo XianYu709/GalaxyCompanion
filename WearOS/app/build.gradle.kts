@@ -41,4 +41,8 @@ dependencies {
     implementation("androidx.wear.compose:compose-foundation:1.6.2")
     implementation("androidx.wear.compose:compose-material3:1.6.2")
     implementation("androidx.health:health-services-client:1.1.0")
+    // Health Services exposes ListenableFuture in its public 1.1.0 API.
+    implementation("com.google.guava:guava:32.0.1-android")
+
+    testImplementation("junit:junit:4.13.2")
 }

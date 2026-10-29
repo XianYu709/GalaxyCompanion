@@ -14,5 +14,8 @@ object GalaxyCompanionGattContract {
     val capabilitiesCharacteristicUuid: UUID = UUID.fromString("2b0d0002-4f31-4bb2-8f63-891bb1bd0001")
     val syncControlCharacteristicUuid: UUID = UUID.fromString("2b0d0003-4f31-4bb2-8f63-891bb1bd0001")
     val syncDataCharacteristicUuid: UUID = UUID.fromString("2b0d0004-4f31-4bb2-8f63-891bb1bd0001")
+    val pairingGateCharacteristicUuid: UUID = UUID.fromString("2b0d0005-4f31-4bb2-8f63-891bb1bd0001")
+
+    val pairingGatePayload: ByteArray = byteArrayOf(0x47, 0x43, 0x50, 0x01, 0x01)
 }
 

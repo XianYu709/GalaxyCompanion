@@ -73,11 +73,40 @@ enum WatchTransportState: Equatable {
         case .discoveringServices:
             "正在确认 GATT 服务和基础特征。"
         case .connected:
-            "连接链路、能力协商和基础健康同步通道均已就绪。"
+            "BLE 链路和设备能力读取已就绪；健康数据传输仍需通过配对验证。"
         case .failed(let reason):
             reason
         case .stopped:
             "未主动保持或恢复当前连接。"
+        }
+    }
+}
+
+enum WatchPairingStatus: Equatable {
+    case notChecked
+    case requestingSystemPairing
+    case trustedForCurrentConnection
+    case failed(String)
+
+    var title: String {
+        switch self {
+        case .notChecked: "尚未验证"
+        case .requestingSystemPairing: "等待系统配对"
+        case .trustedForCurrentConnection: "当前连接已验证"
+        case .failed: "配对验证失败"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .notChecked:
+            "读取受保护特征以请求 iOS 与 Watch 系统完成加密配对。"
+        case .requestingSystemPairing:
+            "请完成系统蓝牙配对提示；若没有弹窗，完成后再次验证。"
+        case .trustedForCurrentConnection:
+            "当前连接已通过系统加密与 MITM 保护校验；健康传输仍待真机 PoC。"
+        case .failed(let reason):
+            reason
         }
     }
 }
@@ -96,10 +125,12 @@ protocol WatchTransport: AnyObject {
     var state: WatchTransportState { get }
     var onStateChange: ((WatchTransportState) -> Void)? { get set }
     var onCapabilitiesChange: ((WatchCapabilities) -> Void)? { get set }
+    var onPairingStatusChange: ((WatchPairingStatus) -> Void)? { get set }
     var onHealthSyncEvent: ((HealthSyncTransportEvent) -> Void)? { get set }
 
     func startDiscovery()
     func stop()
+    func requestSystemPairing()
     func requestHealthSync(
         requestID: UUID,
         after cursor: Int64,

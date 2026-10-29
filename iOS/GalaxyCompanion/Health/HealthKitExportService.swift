@@ -17,6 +17,10 @@ protocol HealthKitStoreClient: AnyObject {
         toShare types: Set<AppleHealthQuantityType>
     ) async throws
     func save(_ payload: AppleHealthSamplePayload) async throws
+    /// Removes only a GalaxyCompanion sample identified by its exact HealthKit
+    /// sync identifier and quantity type. It is used for a cumulative Watch
+    /// correction which invalidates a previously exported positive interval.
+    func delete(_ removal: AppleHealthCumulativeRemoval) async throws
 }
 
 enum HealthKitAuthorizationRequestStatus: Equatable {
@@ -88,6 +92,7 @@ enum HealthKitAuthorizationState: Equatable {
 
 struct HealthKitExportReport: Equatable {
     let writtenSampleCount: Int
+    let removedSampleCount: Int
     let previouslyWrittenSampleCount: Int
     let rejectedSampleCount: Int
     let failures: [String]
@@ -101,13 +106,14 @@ enum HealthKitExportResult: Equatable {
     case unavailable(String)
 }
 
-/// Stores only successfully committed sample identifiers. This is the local
-/// idempotency guard for normal retries. The matching HealthKit sync metadata
-/// preserves a stable source identity and leaves room for a later corrected
-/// sample version to replace the original instead of creating a new identity.
+/// Stores the highest successfully committed revision for every stable sample
+/// identifier. This is the local idempotency guard for normal retries while
+/// allowing HealthKit's sync identifier/version pair to replace a corrected
+/// sample instead of creating a second measurement.
 protocol HealthKitExportLedger: Sendable {
-    func contains(_ sampleID: UUID) async -> Bool
-    func recordWritten(_ sampleID: UUID) async throws
+    func writtenRevision(for sampleID: UUID) async -> Int64?
+    func recordWritten(_ sampleID: UUID, revision: Int64) async throws
+    func removeWritten(_ sampleID: UUID) async throws
 }
 
 enum HealthKitExportLedgerError: Error, LocalizedError {
@@ -124,7 +130,34 @@ enum HealthKitExportLedgerError: Error, LocalizedError {
 
 actor FileHealthKitExportLedger: HealthKitExportLedger {
     private struct State: Codable {
-        var sampleIDs: Set<UUID>
+        var writtenRevisions: [UUID: Int64]
+
+        private enum CodingKeys: String, CodingKey {
+            case writtenRevisions
+            case sampleIDs
+        }
+
+        init(writtenRevisions: [UUID: Int64]) {
+            self.writtenRevisions = writtenRevisions
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            if let revisions = try container.decodeIfPresent([UUID: Int64].self, forKey: .writtenRevisions) {
+                writtenRevisions = revisions
+            } else {
+                // The previous on-disk ledger tracked only identifiers. Those
+                // writes used HealthKit sync version 1, so preserve that exact
+                // idempotency behavior when migrating it.
+                let legacyIDs = try container.decodeIfPresent(Set<UUID>.self, forKey: .sampleIDs) ?? []
+                writtenRevisions = Dictionary(uniqueKeysWithValues: legacyIDs.map { ($0, 1) })
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(writtenRevisions, forKey: .writtenRevisions)
+        }
     }
 
     private let fileURL: URL
@@ -142,7 +175,7 @@ actor FileHealthKitExportLedger: HealthKitExportLedger {
                 let data = try Data(contentsOf: fileURL)
                 state = try JSONDecoder().decode(State.self, from: data)
             } else {
-                state = State(sampleIDs: [])
+                state = State(writtenRevisions: [:])
                 try Self.write(state, to: fileURL)
             }
         } catch {
@@ -150,14 +183,27 @@ actor FileHealthKitExportLedger: HealthKitExportLedger {
         }
     }
 
-    func contains(_ sampleID: UUID) -> Bool {
-        state.sampleIDs.contains(sampleID)
+    func writtenRevision(for sampleID: UUID) -> Int64? {
+        state.writtenRevisions[sampleID]
     }
 
-    func recordWritten(_ sampleID: UUID) throws {
-        guard !state.sampleIDs.contains(sampleID) else { return }
+    func recordWritten(_ sampleID: UUID, revision: Int64) throws {
+        guard revision >= 1 else { throw HealthKitExportLedgerError.unwritable }
+        guard state.writtenRevisions[sampleID, default: 0] < revision else { return }
         var updatedState = state
-        updatedState.sampleIDs.insert(sampleID)
+        updatedState.writtenRevisions[sampleID] = revision
+        do {
+            try Self.write(updatedState, to: fileURL)
+            state = updatedState
+        } catch {
+            throw HealthKitExportLedgerError.unwritable
+        }
+    }
+
+    func removeWritten(_ sampleID: UUID) throws {
+        guard state.writtenRevisions[sampleID] != nil else { return }
+        var updatedState = state
+        updatedState.writtenRevisions.removeValue(forKey: sampleID)
         do {
             try Self.write(updatedState, to: fileURL)
             state = updatedState
@@ -247,10 +293,8 @@ final class HealthKitExportService {
         }
     }
 
-    /// Exports only explicitly authenticated measurement data. Current BLE
-    /// code never supplies that mode because its physical pairing gate is
-    /// intentionally closed; simulator/demo samples therefore cannot reach
-    /// HealthKit through this service.
+    /// Exports only explicitly authenticated measurement data. The caller
+    /// owns BLE synchronization; this service cannot weaken its pairing gate.
     func export(
         _ samples: [HealthSample],
         dataMode: HealthDataMode
@@ -262,10 +306,11 @@ final class HealthKitExportService {
             return .blockedUntrustedData
         }
 
+        let plan = AppleHealthCumulativeNormalizer.exportPlan(from: samples)
         var payloads: [AppleHealthSamplePayload] = []
         var rejected = 0
         var failures: [String] = []
-        for sample in samples {
+        for sample in plan.samples {
             switch AppleHealthSampleMapper.map(sample) {
             case .success(let payload):
                 payloads.append(payload)
@@ -276,7 +321,35 @@ final class HealthKitExportService {
         }
 
         var written = 0
+        var removed = 0
         var previouslyWritten = 0
+
+        for removal in plan.removals {
+            // No positive value for this stable interval has reached HealthKit
+            // from this device, so there is nothing app-owned to retract.
+            guard await ledger.writtenRevision(for: removal.id) != nil else { continue }
+            switch store.sharingAuthorizationStatus(for: removal.quantityType) {
+            case .authorized:
+                break
+            case .denied, .notDetermined:
+                failures.append(
+                    "\(removal.id.uuidString): 未获得 \(removal.quantityType.rawValue) 的写入授权，无法移除已被 Watch 修正的旧值。"
+                )
+                continue
+            }
+
+            do {
+                // Keep the ledger entry until HealthKit confirms deletion.
+                // This makes an interrupted correction retryable and prevents
+                // a stale positive cumulative interval from being forgotten.
+                try await store.delete(removal)
+                try await ledger.removeWritten(removal.id)
+                removed += 1
+            } catch {
+                failures.append("\(removal.id.uuidString): 无法移除已被 Watch 修正的旧值：\(error.localizedDescription)")
+            }
+        }
+
         for payload in payloads {
             switch store.sharingAuthorizationStatus(for: payload.quantityType) {
             case .authorized:
@@ -286,7 +359,9 @@ final class HealthKitExportService {
                 continue
             }
 
-            if await ledger.contains(payload.id) {
+            let revision = Int64(payload.metadata.syncVersion)
+            if let writtenRevision = await ledger.writtenRevision(for: payload.id),
+               writtenRevision >= revision {
                 previouslyWritten += 1
                 continue
             }
@@ -295,7 +370,7 @@ final class HealthKitExportService {
                 // Save a single sample at a time so a failure has an exact
                 // sample identity and can be safely retried later.
                 try await store.save(payload)
-                try await ledger.recordWritten(payload.id)
+                try await ledger.recordWritten(payload.id, revision: revision)
                 written += 1
             } catch {
                 failures.append("\(payload.id.uuidString): \(error.localizedDescription)")
@@ -304,6 +379,7 @@ final class HealthKitExportService {
 
         let report = HealthKitExportReport(
             writtenSampleCount: written,
+            removedSampleCount: removed,
             previouslyWrittenSampleCount: previouslyWritten,
             rejectedSampleCount: rejected,
             failures: failures
@@ -311,7 +387,7 @@ final class HealthKitExportService {
         if failures.isEmpty {
             return .exported(report)
         }
-        if written > 0 || previouslyWritten > 0 {
+        if written > 0 || removed > 0 || previouslyWritten > 0 {
             return .partialFailure(report)
         }
         return .failed(report)
@@ -422,6 +498,31 @@ private final class SystemHealthKitStoreClient: HealthKitStoreClient {
         try await healthStore.save(sample)
     }
 
+    func delete(_ removal: AppleHealthCumulativeRemoval) async throws {
+        guard let quantityType = removal.quantityType.healthKitQuantityType else {
+            throw SystemHealthKitStoreError.unsupportedPayload
+        }
+        // Apple documents that this API deletes only objects this application
+        // saved, and the metadata predicate narrows that further to the exact
+        // GalaxyCompanion sync identifier. See:
+        // https://developer.apple.com/documentation/healthkit/hkhealthstore/deleteobjects(of:predicate:withcompletion:)
+        let predicate = HKQuery.predicateForObjects(
+            withMetadataKey: HKMetadataKeySyncIdentifier,
+            allowedValues: [removal.syncIdentifier]
+        )
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            healthStore.deleteObjects(of: quantityType, predicate: predicate) { success, _, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if success {
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: SystemHealthKitStoreError.deletionFailed)
+                }
+            }
+        }
+    }
+
     private func healthKitSampleTypes(
         for types: Set<AppleHealthQuantityType>
     ) throws -> Set<HKSampleType> {
@@ -435,9 +536,15 @@ private final class SystemHealthKitStoreClient: HealthKitStoreClient {
 
 private enum SystemHealthKitStoreError: LocalizedError {
     case unsupportedPayload
+    case deletionFailed
 
     var errorDescription: String? {
-        "HealthKit 不支持此 GalaxyCompanion 健康样本。"
+        switch self {
+        case .unsupportedPayload:
+            "HealthKit 不支持此 GalaxyCompanion 健康样本。"
+        case .deletionFailed:
+            "HealthKit 未确认移除已被 Watch 修正的旧健康样本。"
+        }
     }
 }
 

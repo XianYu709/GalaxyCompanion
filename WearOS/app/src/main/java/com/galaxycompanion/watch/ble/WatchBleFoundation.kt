@@ -11,6 +11,7 @@ import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
@@ -18,9 +19,15 @@ import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.os.Build
 import android.os.ParcelUuid
-import com.galaxycompanion.watch.BuildConfig
+import com.galaxycompanion.watch.health.WatchHealthCapabilitySnapshot
+import com.galaxycompanion.watch.health.ManualHealthFlushResult
+import com.galaxycompanion.watch.health.WatchHealthManualSyncFlusher
+import com.galaxycompanion.watch.health.WatchHealthSampleStore
 import org.json.JSONObject
 import java.util.ArrayDeque
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.UUID
 
 sealed interface BleFoundationResult {
@@ -35,11 +42,15 @@ sealed interface BleFoundationResult {
  */
 class WatchGattServer(
     context: Context,
-    private val onServiceResult: (Long, BleFoundationResult) -> Unit
+    private val healthCapabilities: () -> WatchHealthCapabilitySnapshot,
+    private val onServiceResult: (Long, BleFoundationResult) -> Unit,
+    private val onManualSyncStatus: (String) -> Unit
 ) {
     private val applicationContext = context.applicationContext
     private val bluetoothManager = applicationContext.getSystemService(BluetoothManager::class.java)
-    private val demoHealthStore = WatchDemoHealthSampleStore(applicationContext)
+    private val sampleStore = WatchHealthSampleStore(applicationContext)
+    private val manualSyncFlusher = WatchHealthManualSyncFlusher(applicationContext)
+    private val manualSyncExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var server: BluetoothGattServer? = null
     private var syncDataCharacteristic: BluetoothGattCharacteristic? = null
     private var serviceRegistrationPending = false
@@ -47,37 +58,80 @@ class WatchGattServer(
     private var pendingService: BluetoothGattService? = null
     private var pendingServiceGeneration: Long? = null
     private var registeredServiceGeneration: Long? = null
-    private val subscribedDevices = mutableSetOf<String>()
-    private val negotiatedMtuByDevice = mutableMapOf<String, Int>()
-    private val pendingNotifications = mutableMapOf<String, ArrayDeque<ByteArray>>()
+    private val authenticatedDeviceAddresses = ConcurrentHashMap.newKeySet<String>()
+    private val subscribedDeviceAddresses = ConcurrentHashMap.newKeySet<String>()
+    private val negotiatedMtuByDevice = ConcurrentHashMap<String, Int>()
+    private val pendingNotificationsByDevice = ConcurrentHashMap<String, ArrayDeque<ByteArray>>()
+    private val notificationInFlightDevices = ConcurrentHashMap.newKeySet<String>()
+    // The iPhone transport permits exactly one outstanding request. Mirror
+    // that bound on the GATT server so an authenticated central cannot build
+    // an unbounded notification queue with overlapping requests.
+    private val syncRequestInFlightDevices = ConcurrentHashMap.newKeySet<String>()
+    private val notificationLock = Any()
 
     /** Current GATT lifecycle generation; callback consumers must match it. */
     val activeGeneration: Long?
         get() = registeredServiceGeneration ?: pendingServiceGeneration
 
-    private val capabilitiesPayload: ByteArray
-        get() = JSONObject()
+    private fun capabilitiesPayload(forDevice: BluetoothDevice): ByteArray {
+        val healthDataMode = if (isAuthenticated(forDevice)) {
+            "authenticatedMeasurement"
+        } else {
+            "unavailable"
+        }
+        return capabilitiesPayload(healthDataMode)
+    }
+
+    private fun capabilitiesPayload(healthDataMode: String): ByteArray {
+        val capabilities = healthCapabilities()
+        val storage = runCatching { sampleStore.summary() }.getOrNull()
+        val recordingEnabled = runCatching { sampleStore.isPassiveCaptureEnabled() }.getOrNull()
+        val payload = JSONObject()
             .put(
                 "identity",
                 JSONObject()
-                    .put("model", if (BuildConfig.DEBUG) "GalaxyCompanion Development Watch" else "GalaxyCompanion Watch")
-                    .put("wearOSVersion", "Wear OS")
-                    .put("firmwareVersion", if (BuildConfig.DEBUG) "0.1.0-debug" else "0.1.0")
+                    .put("model", capabilities.model)
+                    .put("wearOSVersion", capabilities.wearOsVersion)
+                    .put("firmwareVersion", capabilities.firmwareVersion)
             )
             .put("enabled", org.json.JSONArray().apply {
-                put("heartRate")
-                put("steps")
-                put("calories")
-                put("distance")
+                capabilities.metricNames.sorted().forEach(::put)
             })
-            .put(
-                "healthDataMode",
-                if (BuildConfig.DEBUG) "developmentSynthetic" else "unavailable"
-            )
-            .toString()
-            .encodeToByteArray()
+            // A local collection capability alone is never enough. This
+            // value is elevated only after the encrypted pairing gate succeeds
+            // for this currently connected central.
+            .put("healthDataMode", healthDataMode)
+        // This is deliberately count/status only. It makes an empty manual
+        // sync explainable without exposing health history in diagnostics.
+        storage?.let { payload.put("localHealthSampleCount", it.sampleCount) }
+        recordingEnabled?.let { payload.put("isLocalHealthRecordingEnabled", it) }
+        return payload.toString().encodeToByteArray()
+    }
 
     private val callback = object : BluetoothGattServerCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            if (
+                newState == BluetoothProfile.STATE_CONNECTED ||
+                newState == BluetoothProfile.STATE_DISCONNECTED ||
+                status != BluetoothGatt.GATT_SUCCESS
+            ) {
+                authenticatedDeviceAddresses.remove(device.address)
+                subscribedDeviceAddresses.remove(device.address)
+                negotiatedMtuByDevice.remove(device.address)
+                clearPendingNotifications(device.address)
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            // Android reports the negotiated ATT MTU here. A notification has
+            // a three-byte ATT opcode/handle overhead, per the Bluetooth GATT
+            // ATT protocol. Android API: https://developer.android.com/reference/android/bluetooth/BluetoothGattServerCallback#onMtuChanged(android.bluetooth.BluetoothDevice,int)
+            negotiatedMtuByDevice[device.address] = mtu.coerceAtLeast(DEFAULT_ATT_MTU)
+        }
+
+        @SuppressLint("MissingPermission")
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
             val generation = pendingServiceGeneration
             // Android delivers this asynchronously and provides no generation
@@ -99,25 +153,12 @@ class WatchGattServer(
             } else {
                 server?.close()
                 server = null
-                syncDataCharacteristic = null
                 registeredServiceGeneration = null
                 onServiceResult(
                     generation,
                     BleFoundationResult.Unavailable("无法注册 GalaxyCompanion GATT 服务，错误码：$status")
                 )
             }
-        }
-
-        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                subscribedDevices.remove(device.address)
-                negotiatedMtuByDevice.remove(device.address)
-                pendingNotifications.remove(device.address)
-            }
-        }
-
-        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
-            negotiatedMtuByDevice[device.address] = mtu
         }
 
         @SuppressLint("MissingPermission")
@@ -127,12 +168,43 @@ class WatchGattServer(
             offset: Int,
             characteristic: BluetoothGattCharacteristic
         ) {
+            if (characteristic.uuid == GalaxyCompanionGattContract.pairingGateCharacteristicUuid) {
+                val isBonded = device.bondState == BluetoothDevice.BOND_BONDED
+                if (!isBonded) {
+                    server?.sendResponse(
+                        device,
+                        requestId,
+                        BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION,
+                        offset,
+                        null
+                    )
+                    return
+                }
+                val payload = GalaxyCompanionGattContract.pairingGatePayload
+                if (offset != 0) {
+                    server?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null)
+                    return
+                }
+                val accepted = server?.sendResponse(
+                    device,
+                    requestId,
+                    BluetoothGatt.GATT_SUCCESS,
+                    offset,
+                    payload
+                ) == true
+                if (accepted) {
+                    authenticatedDeviceAddresses += device.address
+                }
+                return
+            }
+
             if (characteristic.uuid != GalaxyCompanionGattContract.capabilitiesCharacteristicUuid) {
                 server?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null)
                 return
             }
 
-            if (offset > capabilitiesPayload.size) {
+            val payload = capabilitiesPayload(device)
+            if (offset > payload.size) {
                 server?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null)
                 return
             }
@@ -142,7 +214,7 @@ class WatchGattServer(
                 requestId,
                 BluetoothGatt.GATT_SUCCESS,
                 offset,
-                capabilitiesPayload.copyOfRange(offset, capabilitiesPayload.size)
+                payload.copyOfRange(offset, payload.size)
             )
         }
 
@@ -156,62 +228,62 @@ class WatchGattServer(
             offset: Int,
             value: ByteArray
         ) {
-            // There is no authenticated pairing/session design yet. Debug
-            // builds may emit synthetic fixtures solely for protocol testing;
-            // release builds always fail closed and never transfer health data.
-            if (!BuildConfig.DEBUG) {
-                respondToWriteIfNeeded(device, requestId, responseNeeded, BluetoothGatt.GATT_FAILURE)
-                return
-            }
-            if (
-                characteristic.uuid != GalaxyCompanionGattContract.syncControlCharacteristicUuid ||
-                preparedWrite ||
-                offset != 0
+            if (characteristic.uuid != GalaxyCompanionGattContract.syncControlCharacteristicUuid ||
+                preparedWrite || offset != 0 || !isAuthenticated(device)
             ) {
-                respondToWriteIfNeeded(device, requestId, responseNeeded, BluetoothGatt.GATT_FAILURE)
+                if (responseNeeded) {
+                    server?.sendResponse(
+                        device,
+                        requestId,
+                        if (isAuthenticated(device)) BluetoothGatt.GATT_FAILURE
+                        else BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION,
+                        offset,
+                        null
+                    )
+                }
                 return
             }
 
             val request = decodeSyncRequest(value)
-            if (request == null) {
-                respondToWriteIfNeeded(device, requestId, responseNeeded, BluetoothGatt.GATT_FAILURE)
-                return
-            }
-            if (device.address !in subscribedDevices) {
-                respondToWriteIfNeeded(device, requestId, responseNeeded, BluetoothGatt.GATT_FAILURE)
-                return
-            }
-            if (!pendingNotifications[device.address].isNullOrEmpty()) {
-                respondToWriteIfNeeded(device, requestId, responseNeeded, BluetoothGatt.GATT_FAILURE)
+            if (request == null || device.address !in subscribedDeviceAddresses) {
+                if (responseNeeded) {
+                    server?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null)
+                }
                 return
             }
 
-            val batch = demoHealthStore.nextBatch(
-                requestId = request.requestId,
-                afterCursor = request.afterCursor,
-                requestedMaximumSampleCount = request.maximumSampleCount
-            ) ?: run {
-                respondToWriteIfNeeded(device, requestId, responseNeeded, BluetoothGatt.GATT_FAILURE)
+            if (!syncRequestInFlightDevices.add(device.address)) {
+                if (responseNeeded) {
+                    server?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null)
+                }
                 return
             }
-            val batchJson = demoHealthStore.encodeBatch(batch)
-            val maximumPacketSize = ((negotiatedMtuByDevice[device.address] ?: DEFAULT_ATT_MTU) - ATT_PROTOCOL_OVERHEAD)
-                .coerceAtLeast(GATTHealthSyncPacketCodec.headerLength + 1)
-            val packets = try {
-                GATTHealthSyncPacketCodec.fragment(
-                    payload = batchJson,
-                    protocolVersion = batch.protocolVersion,
-                    sequence = batch.sequence,
-                    maximumPacketSize = maximumPacketSize
+
+            if (responseNeeded && server?.sendResponse(
+                    device,
+                    requestId,
+                    BluetoothGatt.GATT_SUCCESS,
+                    offset,
+                    null
+                ) != true
+            ) {
+                clearPendingNotifications(device.address)
+                onManualSyncStatus("无法确认 iPhone 的手动同步请求；请保持连接后重试。")
+                return
+            }
+
+            onManualSyncStatus("已收到 iPhone 手动同步请求；正在刷新并准备 Watch 本地缓存。")
+            try {
+                manualSyncExecutor.execute {
+                    prepareAndEnqueueManualSync(device, request)
+                }
+            } catch (error: Exception) {
+                clearPendingNotifications(device.address)
+                onManualSyncStatus(
+                    "无法开始手动同步：" +
+                        (error.localizedMessage ?: error.javaClass.simpleName)
                 )
-            } catch (_: IllegalArgumentException) {
-                respondToWriteIfNeeded(device, requestId, responseNeeded, BluetoothGatt.GATT_FAILURE)
-                return
             }
-
-            respondToWriteIfNeeded(device, requestId, responseNeeded, BluetoothGatt.GATT_SUCCESS)
-            pendingNotifications[device.address] = ArrayDeque(packets)
-            sendNextNotification(device)
         }
 
         @SuppressLint("MissingPermission")
@@ -230,26 +302,43 @@ class WatchGattServer(
             val status = when {
                 !isSyncDataSubscription -> BluetoothGatt.GATT_FAILURE
                 value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) -> {
-                    subscribedDevices.add(device.address)
+                    subscribedDeviceAddresses += device.address
                     BluetoothGatt.GATT_SUCCESS
                 }
                 value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE) -> {
-                    subscribedDevices.remove(device.address)
-                    pendingNotifications.remove(device.address)
+                    subscribedDeviceAddresses.remove(device.address)
+                    clearPendingNotifications(device.address)
                     BluetoothGatt.GATT_SUCCESS
                 }
                 else -> BluetoothGatt.GATT_FAILURE
             }
-            respondToWriteIfNeeded(device, requestId, responseNeeded, status)
-        }
-
-        override fun onNotificationSent(device: BluetoothDevice, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                sendNextNotification(device)
-            } else {
-                pendingNotifications.remove(device.address)
+            if (responseNeeded) {
+                server?.sendResponse(device, requestId, status, offset, null)
             }
         }
+
+        @SuppressLint("MissingPermission")
+        override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            synchronized(notificationLock) {
+                val address = device.address
+                notificationInFlightDevices.remove(address)
+                val pending = pendingNotificationsByDevice[address] ?: return
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    clearPendingNotificationsLocked(address)
+                    return
+                }
+                if (pending.isNotEmpty()) {
+                    pending.removeFirst()
+                }
+                if (pending.isEmpty()) {
+                    pendingNotificationsByDevice.remove(address)
+                    syncRequestInFlightDevices.remove(address)
+                } else {
+                    sendNextNotificationLocked(device, address, pending)
+                }
+            }
+        }
+
     }
 
     @SuppressLint("MissingPermission")
@@ -268,15 +357,27 @@ class WatchGattServer(
         service.addCharacteristic(
             BluetoothGattCharacteristic(
                 GalaxyCompanionGattContract.capabilitiesCharacteristicUuid,
-                BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                BluetoothGattCharacteristic.PROPERTY_READ,
                 BluetoothGattCharacteristic.PERMISSION_READ
+            )
+        )
+        service.addCharacteristic(
+            BluetoothGattCharacteristic(
+                GalaxyCompanionGattContract.pairingGateCharacteristicUuid,
+                BluetoothGattCharacteristic.PROPERTY_READ,
+                // Android enforces encrypted/MITM attribute permissions before
+                // delivering this request to the server callback. We still
+                // verify BOND_BONDED and create a connection-local gate below;
+                // neither condition alone is treated as trust. Android API:
+                // https://developer.android.com/reference/android/bluetooth/BluetoothGattCharacteristic#PERMISSION_READ_ENCRYPTED_MITM
+                BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED_MITM
             )
         )
         service.addCharacteristic(
             BluetoothGattCharacteristic(
                 GalaxyCompanionGattContract.syncControlCharacteristicUuid,
                 BluetoothGattCharacteristic.PROPERTY_WRITE,
-                BluetoothGattCharacteristic.PERMISSION_WRITE
+                BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED_MITM
             )
         )
         val syncDataCharacteristic = BluetoothGattCharacteristic(
@@ -291,10 +392,10 @@ class WatchGattServer(
             )
         )
         service.addCharacteristic(syncDataCharacteristic)
+        this.syncDataCharacteristic = syncDataCharacteristic
 
         val generation = ++lifecycleGeneration
         server = openedServer
-        this.syncDataCharacteristic = syncDataCharacteristic
         serviceRegistrationPending = true
         pendingService = service
         pendingServiceGeneration = generation
@@ -312,88 +413,206 @@ class WatchGattServer(
         return BleFoundationResult.Starting
     }
 
+    @SuppressLint("MissingPermission")
     fun stop() {
         lifecycleGeneration += 1
         server?.close()
         server = null
-        syncDataCharacteristic = null
         serviceRegistrationPending = false
         pendingService = null
         pendingServiceGeneration = null
         registeredServiceGeneration = null
-        subscribedDevices.clear()
+        authenticatedDeviceAddresses.clear()
+        subscribedDeviceAddresses.clear()
         negotiatedMtuByDevice.clear()
-        pendingNotifications.clear()
+        pendingNotificationsByDevice.clear()
+        notificationInFlightDevices.clear()
+        syncRequestInFlightDevices.clear()
+        syncDataCharacteristic = null
     }
 
     @SuppressLint("MissingPermission")
-    private fun respondToWriteIfNeeded(
+    private fun isAuthenticated(device: BluetoothDevice): Boolean =
+        device.bondState == BluetoothDevice.BOND_BONDED &&
+            device.address in authenticatedDeviceAddresses
+
+    @SuppressLint("MissingPermission")
+    private fun enqueueNotifications(device: BluetoothDevice, packets: List<ByteArray>): Boolean {
+        synchronized(notificationLock) {
+            val address = device.address
+            if (
+                address !in subscribedDeviceAddresses ||
+                !isAuthenticated(device) ||
+                address !in syncRequestInFlightDevices ||
+                pendingNotificationsByDevice.containsKey(address)
+            ) return false
+            val pending = pendingNotificationsByDevice.getOrPut(address) { ArrayDeque() }
+            packets.forEach(pending::addLast)
+            if (address !in notificationInFlightDevices) {
+                sendNextNotificationLocked(device, address, pending)
+            }
+            return pendingNotificationsByDevice.containsKey(address)
+        }
+    }
+
+    @SuppressLint("MissingPermission", "DEPRECATION")
+    @Suppress("DEPRECATION")
+    private fun sendNextNotificationLocked(
         device: BluetoothDevice,
-        requestId: Int,
-        responseNeeded: Boolean,
-        status: Int
+        address: String,
+        pending: ArrayDeque<ByteArray>
     ) {
-        if (responseNeeded) {
-            server?.sendResponse(device, requestId, status, 0, null)
+        if (pending.isEmpty() || address in notificationInFlightDevices) return
+        val characteristic = syncDataCharacteristic ?: run {
+            // This is a terminal transport failure for this central. Clear
+            // every per-request marker as well as the packets, otherwise a
+            // later control write could be permanently rejected as "in
+            // flight" after the characteristic has gone away.
+            clearPendingNotificationsLocked(address)
+            return
+        }
+        // API 33 accepts an immutable value for this one notification. That
+        // avoids sharing characteristic.value between concurrent centrals.
+        // The deprecated fallback is kept for Wear OS devices below API 33.
+        val notificationQueued = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            server?.notifyCharacteristicChanged(device, characteristic, false, pending.first) ==
+                BluetoothStatusCodes.SUCCESS
+        } else {
+            characteristic.value = pending.first
+            server?.notifyCharacteristicChanged(device, characteristic, false) == true
+        }
+        if (notificationQueued) {
+            notificationInFlightDevices += address
+        } else {
+            clearPendingNotificationsLocked(address)
         }
     }
 
-    @SuppressLint("MissingPermission")
-    private fun sendNextNotification(device: BluetoothDevice) {
-        val queue = pendingNotifications[device.address] ?: return
-        val packet = queue.pollFirst()
-        if (packet == null) {
-            pendingNotifications.remove(device.address)
-            return
-        }
-        val characteristic = syncDataCharacteristic
-        if (characteristic == null || server == null) {
-            pendingNotifications.remove(device.address)
-            return
-        }
+    private fun clearPendingNotifications(address: String) = synchronized(notificationLock) {
+        clearPendingNotificationsLocked(address)
+    }
 
-        val status = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            server?.notifyCharacteristicChanged(device, characteristic, false, packet)
-                ?: BluetoothGatt.GATT_FAILURE
+    private fun clearPendingNotificationsLocked(address: String) {
+        pendingNotificationsByDevice.remove(address)?.clear()
+        notificationInFlightDevices.remove(address)
+        syncRequestInFlightDevices.remove(address)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun prepareAndEnqueueManualSync(device: BluetoothDevice, request: SyncRequest) {
+        // A platform flush is a best-effort cache refresh, not a dependency
+        // for a safe pull. In particular, Health Services may throttle it.
+        val flushResult = manualSyncFlusher.flushBeforeManualPull()
+        try {
+            val preparedResponse = packetsForRequest(device, request)
+            if (!enqueueNotifications(device, preparedResponse.packets)) {
+                clearPendingNotifications(device.address)
+                onManualSyncStatus("无法将手动同步结果送入 BLE 通知队列；请保持连接后重试。")
+                return
+            }
+            onManualSyncStatus(manualSyncStatusFor(preparedResponse, flushResult))
+        } catch (error: Exception) {
+            // The Watch cursor is never acknowledged or advanced by a
+            // request. A failed response can be retried by the phone.
+            clearPendingNotifications(device.address)
+            onManualSyncStatus(
+                "处理 iPhone 手动同步失败：" +
+                    (error.localizedMessage ?: error.javaClass.simpleName)
+            )
+        }
+    }
+
+    private fun manualSyncStatusFor(
+        response: PreparedSyncResponse,
+        flushResult: ManualHealthFlushResult
+    ): String {
+        val cacheNote = when (flushResult) {
+            ManualHealthFlushResult.Completed -> "已请求刷新被动采集缓存。"
+            ManualHealthFlushResult.NotRecording -> "本地健康记录尚未开启。"
+            is ManualHealthFlushResult.CacheStatusUnavailable -> "无法读取本地记录状态。"
+            is ManualHealthFlushResult.Deferred -> "系统暂未完成刷新，已回传现有缓存。"
+        }
+        return if (response.sampleCount == 0) {
+            "iPhone 已请求手动同步；Watch 本地当前没有可回传的健康记录。$cacheNote"
         } else {
-            @Suppress("DEPRECATION")
-            run {
-                characteristic.value = packet
-                if (server?.notifyCharacteristicChanged(device, characteristic, false) == true) {
-                    BluetoothGatt.GATT_SUCCESS
-                } else {
-                    BluetoothGatt.GATT_FAILURE
-                }
+            "iPhone 已请求手动同步；正在回传本页 ${response.sampleCount} 条本地健康记录。$cacheNote"
+        }
+    }
+
+    /**
+     * Selects a page that fits the actual negotiated ATT payload. At the
+     * default MTU this can be fewer than the protocol's 20-sample maximum;
+     * the phone follows the returned cursor and requests the next page. No
+     * record is deleted or cursor acknowledged while reducing the page size.
+     */
+    private fun packetsForRequest(
+        device: BluetoothDevice,
+        request: SyncRequest
+    ): PreparedSyncResponse {
+        var candidateMaximum = request.maximumSampleCount
+        while (true) {
+            val batch = sampleStore.nextBatch(
+                requestID = request.requestID,
+                afterCursor = request.afterCursor,
+                maximumSampleCount = candidateMaximum
+            )
+            try {
+                val packets = GATTHealthSyncPacketCodec.fragment(
+                    payload = batch.payload,
+                    protocolVersion = GalaxyCompanionGattContract.protocolVersion,
+                    sequence = batch.sequence,
+                    maximumPacketSize = notificationPacketSize(device.address)
+                )
+                return PreparedSyncResponse(packets, batch.sampleCount)
+            } catch (error: IllegalArgumentException) {
+                // Failure envelopes are already the smallest valid recovery
+                // response. A single sample that cannot fit must surface as a
+                // request failure rather than silently skipping it.
+                if (batch.isRemoteFailure || batch.sampleCount <= 1) throw error
+                candidateMaximum = minOf(
+                    batch.sampleCount - 1,
+                    maxOf(1, candidateMaximum / 2)
+                )
             }
         }
-        if (status != BluetoothGatt.GATT_SUCCESS) {
-            pendingNotifications.remove(device.address)
-        }
+    }
+
+    private fun notificationPacketSize(address: String): Int {
+        val mtu = negotiatedMtuByDevice[address] ?: DEFAULT_ATT_MTU
+        return (mtu - ATT_PROTOCOL_OVERHEAD).coerceIn(
+            GATTHealthSyncPacketCodec.headerLength + 1,
+            GATTHealthSyncPacketCodec.headerLength + GATTHealthSyncPacketCodec.maximumFragmentPayloadBytes
+        )
     }
 
     private fun decodeSyncRequest(value: ByteArray): SyncRequest? = try {
         val json = JSONObject(value.decodeToString())
-            val protocolVersion = json.getInt("protocolVersion")
-            val requestId = UUID.fromString(json.getString("requestID")).toString()
+        val protocolVersion = json.getInt("protocolVersion")
+        val requestID = UUID.fromString(json.getString("requestID")).toString()
         val afterCursor = json.getLong("afterCursor")
         val maximumSampleCount = json.getInt("maximumSampleCount")
         if (
             protocolVersion != GalaxyCompanionGattContract.protocolVersion ||
-            afterCursor < 0 ||
+            afterCursor < 0L ||
             maximumSampleCount !in 1..MAXIMUM_REQUESTED_SAMPLE_COUNT
         ) {
             null
         } else {
-            SyncRequest(requestId, afterCursor, maximumSampleCount)
+            SyncRequest(requestID, afterCursor, maximumSampleCount)
         }
     } catch (_: Exception) {
         null
     }
 
     private data class SyncRequest(
-        val requestId: String,
+        val requestID: String,
         val afterCursor: Long,
         val maximumSampleCount: Int
+    )
+
+    private data class PreparedSyncResponse(
+        val packets: List<ByteArray>,
+        val sampleCount: Int
     )
 
     private companion object {
@@ -472,10 +691,17 @@ class WatchBleAdvertiser(
 
 class WatchBleController(
     context: Context,
-    private val onAdvertisementResult: (BleFoundationResult) -> Unit
+    healthCapabilities: () -> WatchHealthCapabilitySnapshot,
+    private val onAdvertisementResult: (BleFoundationResult) -> Unit,
+    onManualSyncStatus: (String) -> Unit
 ) {
     private val advertiser = WatchBleAdvertiser(context, onAdvertisementResult)
-    private val gattServer = WatchGattServer(context, ::handleGattServiceResult)
+    private val gattServer = WatchGattServer(
+        context,
+        healthCapabilities,
+        ::handleGattServiceResult,
+        onManualSyncStatus
+    )
     private var shouldAdvertise = false
     private var expectedGattGeneration: Long? = null
 
