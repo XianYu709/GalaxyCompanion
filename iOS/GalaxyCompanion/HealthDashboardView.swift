@@ -39,7 +39,7 @@ struct HealthDashboardView: View {
         if appState.healthSamples.isEmpty {
             return "Watch 离线期间的数据会先保留在手表，连接后由你主动同步。"
         }
-        return "数据存在 iPhone 本地。Apple Health 写入始终由你单独确认。"
+        return "数据保存在 iPhone 本地；已授权类型会在手动同步后自动写入 Apple Health。"
     }
 
     private var syncActions: some View {
@@ -52,14 +52,14 @@ struct HealthDashboardView: View {
                     .foregroundStyle(NightCurrent.muted)
             }
             CurrentPrimaryButton(
-                "同步到 iPhone",
-                symbol: "arrow.down.circle.fill",
+                syncActionTitle,
+                symbol: appState.canSynchronize ? "arrow.down.circle.fill" : "lock.open.fill",
                 tint: appState.canSynchronize ? NightCurrent.mint : NightCurrent.amber,
                 isLoading: appState.isSyncing,
                 action: appState.synchronizeHealth
             )
-            .disabled(!appState.canSynchronize)
-            .opacity(appState.canSynchronize ? 1 : 0.55)
+            .disabled(!appState.isConnected || appState.isSyncing)
+            .opacity(appState.isConnected ? 1 : 0.55)
 
             Divider().overlay(Color.white.opacity(0.10))
             Text(appState.healthSyncStatus.title)
@@ -79,7 +79,7 @@ struct HealthDashboardView: View {
                     } else {
                         Image(systemName: "heart.fill")
                     }
-                    Text("写入 Apple Health")
+                    Text("重新尝试写入 Apple Health")
                     Spacer()
                     Image(systemName: "arrow.up.right")
                 }
@@ -107,7 +107,16 @@ struct HealthDashboardView: View {
             Text(appState.healthKitExportStatus.detail)
                 .font(.caption)
                 .foregroundStyle(NightCurrent.muted)
+            if let exclusionNotice = appState.appleHealthExclusionNotice {
+                Label(exclusionNotice, systemImage: "info.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(NightCurrent.amber)
+            }
         }
+    }
+
+    private var syncActionTitle: String {
+        appState.canSynchronize ? "同步到 iPhone" : "验证并同步到 iPhone"
     }
 
     private var emptyHealthState: some View {
@@ -149,6 +158,9 @@ struct HealthDashboardView: View {
                     sample: latestSample(for: .distance, aggregation: .dailyCumulative)
                 )
                 MetricTile(metric: .totalCalories, sample: latestSample(for: .totalCalories))
+                if let floors = latestSample(for: .floors, aggregation: .dailyCumulative) {
+                    MetricTile(metric: .floors, sample: floors)
+                }
             }
             Label(
                 "日总能量包含基础代谢，只在本应用展示，不写入 Apple Health。",
@@ -232,6 +244,9 @@ struct HealthDashboardView: View {
                 Text(reason.displayText)
                     .font(.footnote)
                     .foregroundStyle(NightCurrent.muted)
+                Text("请在入睡前确认 Watch 已点“启动”，整夜佩戴；次日早晨打开 iPhone 后手动同步。当前不会读取或复刻三星睡眠评分。")
+                    .font(.caption)
+                    .foregroundStyle(NightCurrent.blue)
                 Text("需要同一夜间的真实后台心率与细粒度步数或距离增量；日累计步数不能用于还原夜间活动。")
                     .font(.caption)
                     .foregroundStyle(NightCurrent.amber)

@@ -35,7 +35,7 @@ final class ProtocolCodecTests: XCTestCase {
 
     func testDecodesCapabilitiesPayloadServedByWearGatt() throws {
         let watchPayload = Data(
-            #"{"identity":{"model":"GalaxyCompanion Development Watch","wearOSVersion":"Wear OS","firmwareVersion":"0.1.0-debug"},"enabled":["heartRate","steps","calories","distance"],"healthDataMode":"developmentSynthetic"}"#.utf8
+            #"{"identity":{"model":"GalaxyCompanion Development Watch","wearOSVersion":"Wear OS","firmwareVersion":"0.1.0-debug"},"enabled":["heartRate","steps","calories","distance"],"passiveDataTypeNames":["HeartRate","Daily Steps","Steps"],"healthDataMode":"developmentSynthetic"}"#.utf8
         )
 
         let decoded = try ProtocolCodec.decode(WatchCapabilities.self, from: watchPayload)
@@ -43,6 +43,7 @@ final class ProtocolCodecTests: XCTestCase {
         XCTAssertEqual(decoded.identity.model, "GalaxyCompanion Development Watch")
         XCTAssertEqual(decoded.identity.wearOSVersion, "Wear OS")
         XCTAssertEqual(decoded.enabled, [.heartRate, .steps, .calories, .distance])
+        XCTAssertEqual(decoded.passiveDataTypeNames, ["HeartRate", "Daily Steps", "Steps"])
         XCTAssertEqual(decoded.healthDataMode, .developmentSynthetic)
     }
 

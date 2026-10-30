@@ -6,7 +6,12 @@ import Foundation
 final class CoreBluetoothWatchTransport: NSObject, WatchTransport {
     @MainActor
     private enum Contract {
-        static let service = CBUUID(string: "2B0D0001-4F31-4BB2-8F63-891BB1BD0001")
+        // Revision 7 uses paced ATT notifications. Watch6/iPhone links can
+        // fail an ATT indication before CoreBluetooth delivers its payload;
+        // an incomplete notification page is harmless because the durable
+        // cursor advances only after the full page is persisted. A new UUID
+        // also avoids a bonded iPhone retaining revision 6's indication cache.
+        static let service = CBUUID(string: "2B0D0007-4F31-4BB2-8F63-891BB1BD0001")
         static let capabilities = CBUUID(string: "2B0D0002-4F31-4BB2-8F63-891BB1BD0001")
         static let syncControl = CBUUID(string: "2B0D0003-4F31-4BB2-8F63-891BB1BD0001")
         static let syncData = CBUUID(string: "2B0D0004-4F31-4BB2-8F63-891BB1BD0001")

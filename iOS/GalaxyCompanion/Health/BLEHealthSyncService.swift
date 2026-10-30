@@ -133,7 +133,12 @@ final class BLEHealthSyncService: HealthSyncing {
             )
 
             Task { [weak self] in
-                try? await Task.sleep(for: .seconds(15))
+                // The Watch paces notifications one fragment at a time. A
+                // short cache page is normally much quicker, but a page at
+                // the minimum ATT MTU needs more than the old 15-second
+                // window. The Watch also releases its matching request lease
+                // before this deadline so a retry cannot stay wedged.
+                try? await Task.sleep(for: .seconds(22))
                 self?.expireRequestIfNeeded(requestID)
             }
         }

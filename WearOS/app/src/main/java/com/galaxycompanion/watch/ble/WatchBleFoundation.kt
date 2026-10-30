@@ -20,14 +20,14 @@ import android.content.Context
 import android.os.Build
 import android.os.ParcelUuid
 import com.galaxycompanion.watch.health.WatchHealthCapabilitySnapshot
-import com.galaxycompanion.watch.health.ManualHealthFlushResult
-import com.galaxycompanion.watch.health.WatchHealthManualSyncFlusher
 import com.galaxycompanion.watch.health.WatchHealthSampleStore
 import org.json.JSONObject
 import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.UUID
 
 sealed interface BleFoundationResult {
@@ -49,8 +49,8 @@ class WatchGattServer(
     private val applicationContext = context.applicationContext
     private val bluetoothManager = applicationContext.getSystemService(BluetoothManager::class.java)
     private val sampleStore = WatchHealthSampleStore(applicationContext)
-    private val manualSyncFlusher = WatchHealthManualSyncFlusher(applicationContext)
     private val manualSyncExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val manualSyncWatchdog = Executors.newSingleThreadScheduledExecutor()
     private var server: BluetoothGattServer? = null
     private var syncDataCharacteristic: BluetoothGattCharacteristic? = null
     private var serviceRegistrationPending = false
@@ -63,6 +63,7 @@ class WatchGattServer(
     private val negotiatedMtuByDevice = ConcurrentHashMap<String, Int>()
     private val pendingNotificationsByDevice = ConcurrentHashMap<String, ArrayDeque<ByteArray>>()
     private val notificationInFlightDevices = ConcurrentHashMap.newKeySet<String>()
+    private val manualSyncDeadlineByDevice = ConcurrentHashMap<String, ScheduledFuture<*>>()
     // The iPhone transport permits exactly one outstanding request. Mirror
     // that bound on the GATT server so an authenticated central cannot build
     // an unbounded notification queue with overlapping requests.
@@ -96,6 +97,12 @@ class WatchGattServer(
             )
             .put("enabled", org.json.JSONArray().apply {
                 capabilities.metricNames.sorted().forEach(::put)
+            })
+            // Keep this separate from `enabled`: the runtime inventory tells
+            // iPhone what Health Services reports, while `enabled` is only
+            // the subset this app actually records with a safe wire meaning.
+            .put("passiveDataTypeNames", org.json.JSONArray().apply {
+                capabilities.passiveDataTypeNames.sorted().forEach(::put)
             })
             // A local collection capability alone is never enough. This
             // value is elevated only after the encrypted pairing gate succeeds
@@ -272,8 +279,9 @@ class WatchGattServer(
                 return
             }
 
-            onManualSyncStatus("已收到 iPhone 手动同步请求；正在刷新并准备 Watch 本地缓存。")
+            onManualSyncStatus("已收到 iPhone 手动同步请求；正在准备 Watch 本地缓存。")
             try {
+                scheduleManualSyncDeadline(device.address)
                 manualSyncExecutor.execute {
                     prepareAndEnqueueManualSync(device, request)
                 }
@@ -382,6 +390,11 @@ class WatchGattServer(
         )
         val syncDataCharacteristic = BluetoothGattCharacteristic(
             GalaxyCompanionGattContract.syncDataCharacteristicUuid,
+            // The Android Watch6/iPhone pairing can fail a perfectly valid
+            // ATT indication with "Peer failed to respond". Send one paced
+            // notification at a time instead. If one is missed, the iPhone
+            // does not advance its durable cursor and asks for this same page
+            // again on the next manual pull.
             BluetoothGattCharacteristic.PROPERTY_NOTIFY,
             BluetoothGattCharacteristic.PERMISSION_READ
         )
@@ -428,6 +441,8 @@ class WatchGattServer(
         pendingNotificationsByDevice.clear()
         notificationInFlightDevices.clear()
         syncRequestInFlightDevices.clear()
+        manualSyncDeadlineByDevice.values.forEach { it.cancel(false) }
+        manualSyncDeadlineByDevice.clear()
         syncDataCharacteristic = null
     }
 
@@ -496,13 +511,11 @@ class WatchGattServer(
         pendingNotificationsByDevice.remove(address)?.clear()
         notificationInFlightDevices.remove(address)
         syncRequestInFlightDevices.remove(address)
+        manualSyncDeadlineByDevice.remove(address)?.cancel(false)
     }
 
     @SuppressLint("MissingPermission")
     private fun prepareAndEnqueueManualSync(device: BluetoothDevice, request: SyncRequest) {
-        // A platform flush is a best-effort cache refresh, not a dependency
-        // for a safe pull. In particular, Health Services may throttle it.
-        val flushResult = manualSyncFlusher.flushBeforeManualPull()
         try {
             val preparedResponse = packetsForRequest(device, request)
             if (!enqueueNotifications(device, preparedResponse.packets)) {
@@ -510,7 +523,7 @@ class WatchGattServer(
                 onManualSyncStatus("无法将手动同步结果送入 BLE 通知队列；请保持连接后重试。")
                 return
             }
-            onManualSyncStatus(manualSyncStatusFor(preparedResponse, flushResult))
+            onManualSyncStatus(manualSyncStatusFor(preparedResponse))
         } catch (error: Exception) {
             // The Watch cursor is never acknowledged or advanced by a
             // request. A failed response can be retried by the phone.
@@ -522,21 +535,24 @@ class WatchGattServer(
         }
     }
 
-    private fun manualSyncStatusFor(
-        response: PreparedSyncResponse,
-        flushResult: ManualHealthFlushResult
-    ): String {
-        val cacheNote = when (flushResult) {
-            ManualHealthFlushResult.Completed -> "已请求刷新被动采集缓存。"
-            ManualHealthFlushResult.NotRecording -> "本地健康记录尚未开启。"
-            is ManualHealthFlushResult.CacheStatusUnavailable -> "无法读取本地记录状态。"
-            is ManualHealthFlushResult.Deferred -> "系统暂未完成刷新，已回传现有缓存。"
-        }
+    private fun manualSyncStatusFor(response: PreparedSyncResponse): String {
         return if (response.sampleCount == 0) {
-            "iPhone 已请求手动同步；Watch 本地当前没有可回传的健康记录。$cacheNote"
+            "iPhone 已请求手动同步；Watch 本地当前没有可回传的健康记录。"
         } else {
-            "iPhone 已请求手动同步；正在回传本页 ${response.sampleCount} 条本地健康记录。$cacheNote"
+            "iPhone 已请求手动同步；正在回传本页 ${response.sampleCount} 条本地健康记录。"
         }
+    }
+
+    private fun scheduleManualSyncDeadline(address: String) {
+        manualSyncDeadlineByDevice.remove(address)?.cancel(false)
+        val deadline = manualSyncWatchdog.schedule({
+            synchronized(notificationLock) {
+                if (address !in syncRequestInFlightDevices) return@schedule
+                clearPendingNotificationsLocked(address)
+            }
+            onManualSyncStatus("本次手动同步在确认回传前超时；iPhone 可重新同步。")
+        }, MANUAL_SYNC_DEADLINE_SECONDS, TimeUnit.SECONDS)
+        manualSyncDeadlineByDevice[address] = deadline
     }
 
     /**
@@ -619,6 +635,7 @@ class WatchGattServer(
         const val DEFAULT_ATT_MTU = 23
         const val ATT_PROTOCOL_OVERHEAD = 3
         const val MAXIMUM_REQUESTED_SAMPLE_COUNT = 20
+        const val MANUAL_SYNC_DEADLINE_SECONDS = 20L
         val CLIENT_CHARACTERISTIC_CONFIGURATION_UUID: java.util.UUID = java.util.UUID.fromString(
             "00002902-0000-1000-8000-00805f9b34fb"
         )
@@ -648,7 +665,10 @@ class WatchBleAdvertiser(
         }
 
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
+            // Discovery is user initiated from the foreground Watch screen.
+            // Prefer the lowest-power interval over keeping a fast beacon
+            // alive for a feature that has no realtime requirement.
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
             .setConnectable(true)
             .build()
         val data = AdvertiseData.Builder()

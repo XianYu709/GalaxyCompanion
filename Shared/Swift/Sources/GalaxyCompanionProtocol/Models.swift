@@ -46,19 +46,25 @@ public struct WatchCapabilities: Codable, Equatable, Sendable {
     /// Whether the Watch has a persisted Health Services passive-recording
     /// registration. It does not promise a particular callback cadence.
     public let isLocalHealthRecordingEnabled: Bool?
+    /// Full Health Services passive data-type names reported by this Watch.
+    /// This is a diagnostic inventory, not a promise that every raw platform
+    /// type is collected or has a safe iPhone/HealthKit mapping.
+    public let passiveDataTypeNames: Set<String>
 
     public init(
         identity: WatchIdentity,
         enabled: Set<WatchCapability>,
         healthDataMode: HealthDataMode = .unavailable,
         localHealthSampleCount: Int? = nil,
-        isLocalHealthRecordingEnabled: Bool? = nil
+        isLocalHealthRecordingEnabled: Bool? = nil,
+        passiveDataTypeNames: Set<String> = []
     ) {
         self.identity = identity
         self.enabled = enabled
         self.healthDataMode = healthDataMode
         self.localHealthSampleCount = localHealthSampleCount
         self.isLocalHealthRecordingEnabled = isLocalHealthRecordingEnabled
+        self.passiveDataTypeNames = passiveDataTypeNames
     }
 
     public func supports(_ capability: WatchCapability) -> Bool {
@@ -71,6 +77,7 @@ public struct WatchCapabilities: Codable, Equatable, Sendable {
         case healthDataMode
         case localHealthSampleCount
         case isLocalHealthRecordingEnabled
+        case passiveDataTypeNames
     }
 
     /// Missing disclosure metadata is deliberately treated as unavailable so
@@ -87,6 +94,10 @@ public struct WatchCapabilities: Codable, Equatable, Sendable {
             Bool.self,
             forKey: .isLocalHealthRecordingEnabled
         )
+        passiveDataTypeNames = try container.decodeIfPresent(
+            Set<String>.self,
+            forKey: .passiveDataTypeNames
+        ) ?? []
     }
 }
 

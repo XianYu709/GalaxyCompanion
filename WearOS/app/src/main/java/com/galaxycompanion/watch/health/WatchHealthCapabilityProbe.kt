@@ -22,13 +22,21 @@ data class WatchHealthCapabilitySnapshot(
     val wearOsVersion: String,
     val firmwareVersion: String,
     val metricNames: Set<String>,
+    /**
+     * The full passive Health Services inventory reported by this exact
+     * Watch/runtime. These are diagnostic capability names only: collecting
+     * a type still requires an explicit, semantically safe implementation.
+     */
+    val passiveDataTypeNames: Set<String>,
     /** Health Services reports these per-device at runtime; never assume them. */
     val supportsPassiveHeartRate: Boolean,
     val supportsPassiveDailySteps: Boolean,
     val supportsPassiveDailyCalories: Boolean,
     val supportsPassiveDailyDistance: Boolean,
+    val supportsPassiveDailyFloors: Boolean,
     val supportsPassiveGranularSteps: Boolean,
     val supportsPassiveGranularDistance: Boolean,
+    val supportsPassiveGranularFloors: Boolean,
     val status: String
 ) {
     val displayMetrics: String
@@ -44,12 +52,15 @@ data class WatchHealthCapabilitySnapshot(
             wearOsVersion = "Wear OS ${Build.VERSION.RELEASE}",
             firmwareVersion = Build.DISPLAY ?: "未知",
             metricNames = emptySet(),
+            passiveDataTypeNames = emptySet(),
             supportsPassiveHeartRate = false,
             supportsPassiveDailySteps = false,
             supportsPassiveDailyCalories = false,
             supportsPassiveDailyDistance = false,
+            supportsPassiveDailyFloors = false,
             supportsPassiveGranularSteps = false,
             supportsPassiveGranularDistance = false,
+            supportsPassiveGranularFloors = false,
             status = "正在检查 Health Services 支持情况…"
         )
 
@@ -87,8 +98,10 @@ class WatchHealthCapabilityProbe(
                 val supportsPassiveDailySteps = DataType.STEPS_DAILY in supportedPassive
                 val supportsPassiveDailyCalories = DataType.CALORIES_DAILY in supportedPassive
                 val supportsPassiveDailyDistance = DataType.DISTANCE_DAILY in supportedPassive
+                val supportsPassiveDailyFloors = DataType.FLOORS_DAILY in supportedPassive
                 val supportsPassiveGranularSteps = DataType.STEPS in supportedPassive
                 val supportsPassiveGranularDistance = DataType.DISTANCE in supportedPassive
+                val supportsPassiveGranularFloors = DataType.FLOORS in supportedPassive
                 val metrics = buildSet {
                     if (supportsPassiveHeartRate) {
                         add("heartRate")
@@ -102,15 +115,21 @@ class WatchHealthCapabilityProbe(
                     if (supportsPassiveDailyDistance || supportsPassiveGranularDistance) {
                         add("distance")
                     }
+                    if (supportsPassiveDailyFloors || supportsPassiveGranularFloors) {
+                        add("floors")
+                    }
                 }
                 WatchHealthCapabilitySnapshot.checking().copy(
                     metricNames = metrics,
+                    passiveDataTypeNames = supportedPassive.map { it.name }.toSet(),
                     supportsPassiveHeartRate = supportsPassiveHeartRate,
                     supportsPassiveDailySteps = supportsPassiveDailySteps,
                     supportsPassiveDailyCalories = supportsPassiveDailyCalories,
                     supportsPassiveDailyDistance = supportsPassiveDailyDistance,
+                    supportsPassiveDailyFloors = supportsPassiveDailyFloors,
                     supportsPassiveGranularSteps = supportsPassiveGranularSteps,
                     supportsPassiveGranularDistance = supportsPassiveGranularDistance,
+                    supportsPassiveGranularFloors = supportsPassiveGranularFloors,
                     status = if (metrics.isEmpty()) {
                         "Health Services 未报告可供本应用使用的基础指标"
                     } else {

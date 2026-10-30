@@ -31,6 +31,10 @@ final class AppState {
     private(set) var retentionRecoveryCursor: Int64?
     private(set) var retentionRecoveryNotice: String?
     private(set) var lastSyncAt: Date?
+    // A Health-tab tap can start the protected pairing read first. Keep that
+    // explicit intent only for the current connection, then continue the
+    // same manual pull after the Watch re-publishes authenticated capability.
+    private var synchronizeAfterPairing = false
 
     init(transport: (any WatchTransport)? = nil) {
         let selectedTransport = transport ?? Self.defaultTransport()
@@ -63,15 +67,20 @@ final class AppState {
                 self?.refreshSyncAvailability()
             } else {
                 self?.pairingStatus = .notChecked
+                self?.synchronizeAfterPairing = false
                 self?.refreshSyncAvailability()
             }
         }
         selectedTransport.onCapabilitiesChange = { [weak self] capabilities in
             self?.capabilities = capabilities
             self?.refreshSyncAvailability()
+            self?.continueSynchronizationAfterPairingIfReady()
         }
         selectedTransport.onPairingStatusChange = { [weak self] status in
             self?.pairingStatus = status
+            if case .failed = status {
+                self?.synchronizeAfterPairing = false
+            }
             self?.refreshSyncAvailability()
         }
 
@@ -147,7 +156,31 @@ final class AppState {
         guard healthKitAuthorizationStatus.canExportAuthorizedData else {
             return "先在“设备”中允许 GalaxyCompanion 写入 Apple Health。"
         }
-        return "已授权的样本可以由你主动写入 Apple Health；无需保持 Watch 在线。"
+        return "已授权的样本会在手动同步完成后自动写入 Apple Health；无需保持 Watch 在线。"
+    }
+
+    /// Pulled data is never silently relabelled merely to fit a HealthKit
+    /// type. Keep this visible whenever the Watch supplied a value that the
+    /// iPhone intentionally retains only inside GalaxyCompanion.
+    var appleHealthExclusionNotice: String? {
+        let totalEnergyCount = healthSamples.filter { $0.metric == .totalCalories }.count
+        let unsupportedCount = healthSamples.filter {
+            switch $0.metric {
+            case .totalCalories, .ibi, .hrv, .respiratoryRate, .skinTemperature:
+                true
+            default:
+                false
+            }
+        }.count - totalEnergyCount
+
+        var notices: [String] = []
+        if totalEnergyCount > 0 {
+            notices.append("\(totalEnergyCount) 条日总能量未写入 Apple Health（可能包含基础代谢，不能当作活动能量）。")
+        }
+        if unsupportedCount > 0 {
+            notices.append("\(unsupportedCount) 条暂不具备安全 Apple Health 映射的记录仅保留在本应用。")
+        }
+        return notices.isEmpty ? nil : notices.joined(separator: " ")
     }
 
     /// Explains the Watch-side cache before a manual pull. This avoids making
@@ -157,7 +190,7 @@ final class AppState {
             return "连接 Watch 后会显示它是否已开始本地健康记录。"
         }
         if capabilities.isLocalHealthRecordingEnabled == false {
-            return "Watch 尚未开启本地健康记录。请在 Watch 的 GalaxyCompanion 中点“开启本地健康记录”。"
+            return "Watch 尚未开启本地健康记录。请在 Watch 的 GalaxyCompanion 中点“启动”。"
         }
         guard let count = capabilities.localHealthSampleCount else {
             return "此 Watch 版本未报告本地记录数。手动同步会安全请求已有缓存。"
@@ -181,8 +214,23 @@ final class AppState {
     }
 
     func synchronizeHealth() {
+        // The same AppState is shared by all three tabs. A second tap from a
+        // different tab must never replace a real in-flight pull with the
+        // misleading "already waiting" failure seen in the old UI.
+        guard !isSyncing else { return }
         guard let healthSyncService else {
             healthSyncStatus = .unavailable("无法打开 iPhone 本地健康数据仓库。")
+            return
+        }
+        guard isConnected else {
+            healthSyncStatus = .blocked(syncRequirementDetail)
+            return
+        }
+        guard pairingStatus == .trustedForCurrentConnection,
+              capabilities?.healthDataMode == .authenticatedMeasurement else {
+            synchronizeAfterPairing = true
+            healthSyncStatus = .blocked("正在验证当前 BLE 会话的系统安全配对；验证成功后会自动开始同步。")
+            requestSystemPairing()
             return
         }
         guard canSynchronize else {
@@ -190,6 +238,7 @@ final class AppState {
             return
         }
 
+        synchronizeAfterPairing = false
         healthSyncStatus = .syncing
         Task { [weak self, healthSyncService] in
             do {
@@ -201,8 +250,15 @@ final class AppState {
                 retentionRecoveryCursor = nil
                 retentionRecoveryNotice = nil
                 healthSyncStatus = .synced(snapshot)
+                await exportSyncedSamplesToAppleHealthIfPossible()
             } catch let error as BLEHealthSyncServiceError {
                 guard let self else { return }
+                if case .synchronizationAlreadyInProgress = error {
+                    // The original request remains authoritative and owns
+                    // the continuation. Leave its progress visible instead
+                    // of presenting a false terminal failure.
+                    return
+                }
                 if case .retentionGap(let cursor) = error {
                     retentionRecoveryCursor = cursor
                 }
@@ -245,33 +301,77 @@ final class AppState {
 
         Task { [weak self, healthKitExportService] in
             let status = await healthKitExportService.requestAuthorization()
-            self?.healthKitAuthorizationStatus = status
+            guard let self else { return }
+            healthKitAuthorizationStatus = status
+            await exportCachedSamplesToAppleHealthIfPossible()
         }
     }
 
     func exportToAppleHealth() {
+        Task { [weak self] in
+            await self?.exportCachedSamplesToAppleHealthIfPossible()
+        }
+    }
+
+    /// A manual Watch pull is the user's explicit intent to update both local
+    /// iPhone storage and Apple Health. Request HealthKit consent only when
+    /// the system says it is needed, then export every safely mappable value.
+    /// Unsupported values remain local and are surfaced in the dashboard.
+    private func exportSyncedSamplesToAppleHealthIfPossible() async {
+        guard !healthSamples.isEmpty else { return }
         guard let healthKitExportService else {
             healthKitExportStatus = .blocked("Apple Health 写入服务不可用。")
             return
         }
-        guard canExportToAppleHealth else {
+
+        switch healthKitAuthorizationStatus {
+        case .needsAuthorization, .unknown:
+            healthKitAuthorizationStatus = .checking
+            healthKitAuthorizationStatus = await healthKitExportService.requestAuthorization()
+        case .checking:
+            healthKitAuthorizationStatus = await healthKitExportService.refreshAuthorization()
+            if case .needsAuthorization = healthKitAuthorizationStatus {
+                healthKitAuthorizationStatus = await healthKitExportService.requestAuthorization()
+            } else if case .unknown = healthKitAuthorizationStatus {
+                healthKitAuthorizationStatus = await healthKitExportService.requestAuthorization()
+            }
+        case .authorized, .partiallyAuthorized, .unavailable, .denied, .failed:
+            break
+        }
+        await exportCachedSamplesToAppleHealthIfPossible()
+    }
+
+    private func exportCachedSamplesToAppleHealthIfPossible() async {
+        guard let healthKitExportService else {
+            healthKitExportStatus = .blocked("Apple Health 写入服务不可用。")
+            return
+        }
+        guard transportMode == .hardware else {
+            healthKitExportStatus = .blocked("模拟传输不会写入 Apple Health。")
+            return
+        }
+        guard !healthSamples.isEmpty, hasAppleHealthExportableSamples else {
+            healthKitExportStatus = .blocked(
+                appleHealthExclusionNotice ?? "当前没有可安全写入 Apple Health 的健康记录。"
+            )
+            return
+        }
+        guard healthKitAuthorizationStatus.canExportAuthorizedData else {
             healthKitExportStatus = .blocked(appleHealthExportRequirementDetail)
             return
         }
+        guard !isExporting else { return }
 
         healthKitExportStatus = .exporting
         let samples = healthSamples
-        Task { [weak self, healthKitExportService] in
-            // The durable store is written only by this AppState after the
-            // authenticated BLE sync gate. Export stays user-initiated and
-            // may happen later while the Watch is offline; a simulated
-            // transport is rejected above.
-            let result = await healthKitExportService.export(
-                samples,
-                dataMode: .authenticatedMeasurement
-            )
-            self?.healthKitExportStatus = .result(result)
-        }
+        // The durable store is written only after the authenticated BLE sync
+        // gate. Re-running this method is safe: HealthKit sync identifiers
+        // and the local ledger make it idempotent.
+        let result = await healthKitExportService.export(
+            samples,
+            dataMode: .authenticatedMeasurement
+        )
+        healthKitExportStatus = .result(result)
     }
 
     /// Re-runs the deterministic on-device sleep policy over the encrypted
@@ -301,6 +401,12 @@ final class AppState {
         }
         if case .failed = healthSyncStatus { return }
         healthSyncStatus = .blocked(syncRequirementDetail)
+    }
+
+    private func continueSynchronizationAfterPairingIfReady() {
+        guard synchronizeAfterPairing, canSynchronize else { return }
+        synchronizeAfterPairing = false
+        synchronizeHealth()
     }
 
     private func refreshHealthKitAuthorization() async {
@@ -361,7 +467,7 @@ enum HealthSyncStatus: Equatable {
             "正在从手表增量拉取并安全保存到 iPhone。"
         case .synced(let snapshot):
             if snapshot.samples.isEmpty, snapshot.cursor == 0 {
-                "Watch 已响应同步请求，但没有返回本地健康记录。请先在 Watch 开启本地健康记录并等待 Health Services 保存样本。"
+                "Watch 已响应同步请求，但没有返回本地健康记录。请先在 Watch 点“启动”并等待 Health Services 保存样本。"
             } else {
                 "cursor \(snapshot.cursor) · 新增 \(snapshot.insertedSampleCount) · 修订 \(snapshot.updatedSampleCount) · 重复 \(snapshot.duplicateSampleCount)"
             }
@@ -399,9 +505,9 @@ enum HealthKitExportStatus: Equatable {
         case .result(let result):
             switch result {
             case .exported(let report):
-                return "已写入 \(report.writtenSampleCount) 条、移除 \(report.removedSampleCount) 条修正前数据；此前已写入 \(report.previouslyWrittenSampleCount) 条。"
+                return exportDetail(report)
             case .partialFailure(let report):
-                return "已写入 \(report.writtenSampleCount) 条、移除 \(report.removedSampleCount) 条修正前数据；\(report.failures.count) 条需要处理。"
+                return "\(exportDetail(report)) \(report.failures.count) 条需要处理。"
             case .failed(let report):
                 return report.failures.first ?? "没有样本被写入。"
             case .blockedUntrustedData:
@@ -412,6 +518,14 @@ enum HealthKitExportStatus: Equatable {
         case .blocked(let reason):
             return reason
         }
+    }
+
+    private func exportDetail(_ report: HealthKitExportReport) -> String {
+        var detail = "已写入 \(report.writtenSampleCount) 条、移除 \(report.removedSampleCount) 条修正前数据；此前已写入 \(report.previouslyWrittenSampleCount) 条。"
+        if report.rejectedSampleCount > 0 {
+            detail += " \(report.rejectedSampleCount) 条因类型、单位或质量不安全而仅保留在本应用。"
+        }
+        return detail
     }
 }
 

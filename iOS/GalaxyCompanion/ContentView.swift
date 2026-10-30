@@ -62,8 +62,8 @@ private struct OverviewView: View {
                         isLoading: appState.isSyncing || isConnecting,
                         action: primaryAction
                     )
-                    .disabled(isConnecting)
-                    .opacity(isConnecting ? 0.75 : 1)
+                    .disabled(isConnecting || appState.isSyncing)
+                    .opacity(isConnecting || appState.isSyncing ? 0.75 : 1)
 
                     CurrentCard(title: "数据状态", symbol: "arrow.triangle.2.circlepath", tint: syncTint) {
                         Text(appState.healthSyncStatus.title)
@@ -132,6 +132,7 @@ private struct OverviewView: View {
     }
 
     private var primaryTitle: String {
+        if appState.isSyncing { return "正在同步，请稍候" }
         if !appState.isConnected { return "搜索我的手表" }
         if appState.pairingStatus != .trustedForCurrentConnection { return "验证安全配对" }
         if appState.capabilities?.healthDataMode != .authenticatedMeasurement {
@@ -211,6 +212,7 @@ private struct DeviceView: View {
                         }
                         .buttonStyle(.bordered)
                         .tint(NightCurrent.blue)
+                        .disabled(appState.isSyncing)
                     }
 
                     CurrentCard(title: "系统安全配对", symbol: "lock.shield", tint: pairingTint) {
@@ -221,7 +223,7 @@ private struct DeviceView: View {
                         Button("请求 / 验证蓝牙配对") { appState.requestSystemPairing() }
                             .buttonStyle(.borderedProminent)
                             .tint(pairingTint)
-                            .disabled(!appState.isConnected)
+                            .disabled(!appState.isConnected || appState.isSyncing)
                     }
 
                     CurrentCard(title: "Watch 身份与能力", symbol: "cpu", tint: NightCurrent.blue) {
@@ -240,9 +242,27 @@ private struct DeviceView: View {
                                 KeyValueRow(label: "可同步本地记录", value: "\(sampleCount) 条")
                             }
                             Divider().overlay(Color.white.opacity(0.10))
+                            Text("正在采集")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(NightCurrent.fog)
                             Text(capabilities.enabled.sorted { $0.rawValue < $1.rawValue }.map(\.deviceLabel).joined(separator: " · "))
                                 .font(.footnote)
                                 .foregroundStyle(NightCurrent.muted)
+                            if !capabilities.passiveDataTypeNames.isEmpty {
+                                Divider().overlay(Color.white.opacity(0.10))
+                                Label(
+                                    "Health Services 被动能力（\(capabilities.passiveDataTypeNames.count) 项）",
+                                    systemImage: "sensor.tag.radiowaves.forward"
+                                )
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(NightCurrent.blue)
+                                Text(capabilities.passiveDataTypeDisplay)
+                                    .font(.caption)
+                                    .foregroundStyle(NightCurrent.muted)
+                                Text("这是本机实时报告的系统能力；只有具备明确数据含义与安全映射的项目才会自动采集。血氧与压力需要独立三星传感器 PoC。")
+                                    .font(.caption2)
+                                    .foregroundStyle(NightCurrent.muted.opacity(0.9))
+                            }
                         } else {
                             EmptyDeviceDetail()
                         }
@@ -267,6 +287,11 @@ private struct DeviceView: View {
                         Text(appState.healthKitExportStatus.detail)
                             .font(.footnote)
                             .foregroundStyle(NightCurrent.muted)
+                        if let exclusionNotice = appState.appleHealthExclusionNotice {
+                            Label(exclusionNotice, systemImage: "info.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(NightCurrent.amber)
+                        }
                         if !appState.canExportToAppleHealth {
                             Text(appState.appleHealthExportRequirementDetail)
                                 .font(.caption)
@@ -397,6 +422,34 @@ private extension WatchCapability {
         case .nfcReader: "NFC Reader"
         case .nfcHce: "NFC HCE"
         }
+    }
+}
+
+private extension WatchCapabilities {
+    var passiveDataTypeDisplay: String {
+        passiveDataTypeNames
+            .map { name in
+                switch name {
+                case "HeartRate": "心率"
+                case "Daily Steps": "日累计步数"
+                case "Steps": "步数增量"
+                case "Daily Calories": "日总能量"
+                case "Calories": "能量增量"
+                case "Daily Distance": "日累计距离"
+                case "Distance": "距离增量"
+                case "Daily Floors": "日累计楼层"
+                case "Floors": "楼层增量"
+                case "Elevation Gain": "爬升"
+                case "Daily Elevation Gain": "日累计爬升"
+                case "Walking Steps": "步行步数"
+                case "Running Steps": "跑步步数"
+                case "Speed": "速度"
+                case "Location": "位置"
+                default: name
+                }
+            }
+            .sorted()
+            .joined(separator: " · ")
     }
 }
 

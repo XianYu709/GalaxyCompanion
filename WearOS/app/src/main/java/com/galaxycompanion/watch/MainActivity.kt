@@ -2,13 +2,12 @@ package com.galaxycompanion.watch
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.os.Bundle
 import android.os.Build
+import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -21,9 +20,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
-import androidx.wear.compose.material3.Card
-import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.Button
+import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.Text
 import com.galaxycompanion.watch.ble.BleFoundationResult
 import com.galaxycompanion.watch.ble.WatchBleController
@@ -32,28 +30,39 @@ import com.galaxycompanion.watch.health.WatchHealthCapabilitySnapshot
 import com.galaxycompanion.watch.health.WatchHealthCaptureController
 import com.galaxycompanion.watch.health.WatchHealthCaptureSnapshot
 
+/**
+ * The Watch is intentionally a low-interaction data source. Starting it asks
+ * for only the necessary platform permissions, begins balanced BLE
+ * advertising and persists Health Services' passive batches. Pairing,
+ * manual pulls, Apple Health and diagnostics belong to the iPhone app.
+ */
 class MainActivity : ComponentActivity() {
-    private var status by mutableStateOf("等待启动 GalaxyCompanion BLE 服务")
-    private var manualSyncStatus by mutableStateOf("尚未收到 iPhone 的手动同步请求")
+    private var status by mutableStateOf("点按启动后，可由 iPhone 搜索此 Watch。")
     private var healthCapabilities by mutableStateOf(WatchHealthCapabilitySnapshot.checking())
     private var healthCapture by mutableStateOf(
-        WatchHealthCaptureSnapshot("尚未请求本地健康采集权限", 0, null)
+        WatchHealthCaptureSnapshot("等待启动本地健康记录", 0, null)
     )
+    private var startInProgress by mutableStateOf(false)
+    private var startRequested = false
+    private var healthStartDispatched = false
+    private var healthPermissionRequestInFlight = false
+
     private val healthProbe by lazy {
         WatchHealthCapabilityProbe(applicationContext) { snapshot ->
-            runOnUiThread { healthCapabilities = snapshot }
+            runOnUiThread {
+                healthCapabilities = snapshot
+                ensurePassiveHealthRecordingIfRequested()
+            }
         }
     }
     private val bleController by lazy {
         WatchBleController(
             context = applicationContext,
             healthCapabilities = healthProbe::snapshot,
-            onAdvertisementResult = { result ->
-                runOnUiThread { updateStatus(result) }
-            },
-            onManualSyncStatus = { syncStatus ->
-                runOnUiThread { manualSyncStatus = syncStatus }
-            }
+            onAdvertisementResult = { result -> runOnUiThread { updateStatus(result) } },
+            // The iPhone displays per-pull transport diagnostics. The Watch
+            // remains a simple, tappable source screen.
+            onManualSyncStatus = {}
         )
     }
     private val healthCaptureController by lazy {
@@ -65,16 +74,22 @@ class MainActivity : ComponentActivity() {
     private val bluetoothPermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
-        val granted = grants.values.all { it }
-        if (granted) {
+        if (grants.values.all { it }) {
             updateStatus(bleController.start())
         } else {
+            startInProgress = false
             status = "需要蓝牙权限才能让 iPhone 发现手表服务。"
         }
+        ensurePassiveHealthRecordingIfRequested()
     }
+
     private val healthPermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
+        healthPermissionRequestInFlight = false
+        // The controller checks the actual grants and reports an actionable
+        // status when Health Services cannot start. No separate Watch switch
+        // is needed after the one Start action.
         healthCaptureController.startAfterPermissionRequest()
     }
 
@@ -84,18 +99,10 @@ class MainActivity : ComponentActivity() {
         healthCaptureController.refreshSummary()
         setContent {
             GalaxyCompanionWatchApp(
-                status = status,
-                manualSyncStatus = manualSyncStatus,
-                healthCapabilities = healthCapabilities,
+                bleStatus = status,
                 healthCapture = healthCapture,
-                onStart = ::requestBluetoothAndStart,
-                onRefreshHealthCapabilities = healthProbe::refresh,
-                onStartLocalHealthCapture = ::requestHealthAndStartCapture,
-                onStopPassiveCapture = healthCaptureController::stopPassiveCapture,
-                onStop = {
-                    bleController.stop()
-                    status = "BLE 服务已停止"
-                }
+                startInProgress = startInProgress,
+                onStart = ::startWatchSource
             )
         }
     }
@@ -107,12 +114,38 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    override fun onStop() {
+        // The person must deliberately reopen this tiny source screen before
+        // a manual iPhone pull. Do not leave a connectable BLE beacon running
+        // while the display/app is no longer foreground; Health Services'
+        // passive local recording has its own system registration and keeps
+        // collecting independently of this UI.
+        bleController.stop()
+        startInProgress = false
+        if (status.startsWith("已启动") || status.startsWith("正在启动")) {
+            status = "连接广播已暂停；本地健康记录仍会由系统低功耗保存。"
+        }
+        super.onStop()
+    }
+
+    private fun startWatchSource() {
+        // Update synchronously so a tap never looks ignored while Android is
+        // preparing the GATT server or a system permission prompt.
+        Log.i(LOG_TAG, "Watch source start requested")
+        startInProgress = true
+        status = "已收到启动请求，正在准备低功耗连接服务…"
+        startRequested = true
+        healthStartDispatched = false
+        requestBluetoothAndStart()
+        healthProbe.refresh()
+        ensurePassiveHealthRecordingIfRequested()
+    }
+
     private fun requestBluetoothAndStart() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             updateStatus(bleController.start())
             return
         }
-
         val permissions = arrayOf(
             Manifest.permission.BLUETOOTH_ADVERTISE,
             Manifest.permission.BLUETOOTH_CONNECT,
@@ -121,7 +154,6 @@ class MainActivity : ComponentActivity() {
         val missingPermissions = permissions.filter {
             checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
         }
-
         if (missingPermissions.isEmpty()) {
             updateStatus(bleController.start())
         } else {
@@ -129,135 +161,99 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestHealthAndStartCapture() {
+    private fun ensurePassiveHealthRecordingIfRequested() {
+        if (!startRequested || healthStartDispatched || healthPermissionRequestInFlight) return
+        // The probe is asynchronous. Waiting for its final snapshot prevents
+        // a first Start tap from registering an empty data-type set.
+        if (healthCapabilities.status.startsWith("正在检查")) return
+
         val missingPermissions = healthCaptureController.requiredPermissions().filter {
             checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
         }
         if (missingPermissions.isEmpty()) {
+            healthStartDispatched = true
             healthCaptureController.startAfterPermissionRequest()
         } else {
+            healthStartDispatched = true
+            healthPermissionRequestInFlight = true
             healthPermissions.launch(missingPermissions.toTypedArray())
         }
     }
 
     private fun updateStatus(result: BleFoundationResult) {
+        startInProgress = result is BleFoundationResult.Starting
         status = when (result) {
-            BleFoundationResult.Starting -> "正在启动可连接的 BLE 广播…"
-            BleFoundationResult.Started -> "BLE 服务正在广播；现在可在 iPhone 上搜索手表。"
+            BleFoundationResult.Starting -> "正在启动低功耗 BLE 连接服务…"
+            BleFoundationResult.Started -> "已启动。现在可在 iPhone 上连接、配对并手动同步。"
             is BleFoundationResult.Unavailable -> result.reason
         }
+    }
+
+    private companion object {
+        const val LOG_TAG = "GalaxyCompanion"
     }
 }
 
 @Composable
 private fun GalaxyCompanionWatchApp(
-    status: String,
-    manualSyncStatus: String,
-    healthCapabilities: WatchHealthCapabilitySnapshot,
+    bleStatus: String,
     healthCapture: WatchHealthCaptureSnapshot,
-    onStart: () -> Unit,
-    onRefreshHealthCapabilities: () -> Unit,
-    onStartLocalHealthCapture: () -> Unit,
-    onStopPassiveCapture: () -> Unit,
-    onStop: () -> Unit
+    startInProgress: Boolean,
+    onStart: () -> Unit
 ) {
     MaterialTheme {
-        val scrollState = rememberScalingLazyListState()
+        // A regular Column clips on small, round Watches. The UI deliberately
+        // stays tiny: one action and only the status needed at the source.
+        val listState = rememberScalingLazyListState()
+        val sourceStarted = bleStatus.startsWith("已启动")
         ScalingLazyColumn(
-            modifier = Modifier
-                .fillMaxSize(),
-            state = scrollState,
+            modifier = Modifier.fillMaxSize(),
+            state = listState,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             item {
-                Column(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
+                Text(
+                    "GalaxyCompanion",
+                    modifier = Modifier.padding(top = 10.dp, bottom = 6.dp)
+                )
+            }
+            item {
+                Button(
+                    onClick = onStart,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
                 ) {
-                    Text("GalaxyCompanion")
-                    Text("连接与健康")
+                    Text(
+                        when {
+                            startInProgress -> "正在启动…"
+                            sourceStarted -> "已启动"
+                            else -> "启动"
+                        }
+                    )
                 }
             }
             item {
-                WatchInfoCard(title = "BLE 连接", detail = status)
-            }
-            item {
-                Button(onClick = onStart) { Text("启动 BLE") }
-            }
-            item {
-                Button(onClick = onStop) { Text("停止连接") }
-            }
-            item {
-                WatchInfoCard(
-                    title = "安全配对",
-                    detail = "在 iPhone 请求验证后，按双方系统提示完成蓝牙配对。健康数据只会在当前受保护连接中同步。"
+                Text(
+                    bleStatus,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
                 )
             }
             item {
-                WatchInfoCard(title = "手动同步状态", detail = manualSyncStatus)
-            }
-            item {
-                WatchInfoCard(
-                    title = "Health Services",
-                    detail = healthCapabilities.status
+                Text(
+                    "本地缓存 ${healthCapture.storedSampleCount ?: 0} 条 · 仅手动同步时传输",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
                 )
             }
             item {
-                WatchInfoCard(
-                    title = "可用指标",
-                    detail = if (healthCapabilities.metricNames.isEmpty()) {
-                        "等待检查或此手表未报告基础指标"
-                    } else {
-                        healthCapabilities.displayMetrics
-                    }
-                )
+                // Extra bottom space lets the final line clear the system
+                // gesture area on devices with a chin or larger insets.
+                Text("", modifier = Modifier.padding(bottom = 24.dp))
             }
-            item {
-                WatchInfoCard(
-                    title = "睡眠输入",
-                    detail = if (healthCapabilities.supportsSleepInputs) {
-                        "真机支持后台心率和活动增量。本机只做留存；iPhone 手动同步后再本地估算睡眠。"
-                    } else {
-                        "后台心率或活动增量尚未由 Health Services 支持；不会生成睡眠估算。"
-                    }
-                )
-            }
-            item {
-                Button(onClick = onRefreshHealthCapabilities) { Text("刷新健康能力") }
-            }
-            item {
-                WatchInfoCard(title = "本地健康记录", detail = healthCapture.status)
-            }
-            item {
-                WatchInfoCard(
-                    title = "本地真实样本",
-                    detail = buildString {
-                        append(healthCapture.storedSampleCount?.toString() ?: "无法读取")
-                        healthCapture.latestSample?.let { append(" · $it") }
-                    }
-                )
-            }
-            item {
-                Button(onClick = onStartLocalHealthCapture) { Text("开启本地健康记录") }
-            }
-            item {
-                Button(onClick = onStopPassiveCapture) { Text("暂停本地健康记录") }
-            }
-        }
-    }
-}
-
-@Composable
-private fun WatchInfoCard(title: String, detail: String) {
-    Card(
-        onClick = {},
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 10.dp)
-    ) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Text(title)
-            Text(detail)
         }
     }
 }

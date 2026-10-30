@@ -93,6 +93,20 @@ public enum AppleHealthSampleMappingError: Error, Equatable, Sendable {
 /// The sole policy for mapping protocol samples into Apple Health quantities.
 /// Every case is explicit; there is deliberately no raw-value fallback.
 public enum AppleHealthSampleMapper {
+    /// The current Watch collector can produce heart rate, steps, distance
+    /// and floors with a safe HealthKit meaning. Keep the system consent
+    /// prompt to that concrete minimum; future sensor modules request their
+    /// own additional types only after they exist and pass their mapping PoC.
+    public static let authorizationQuantityTypes: Set<AppleHealthQuantityType> = [
+        .stepCount,
+        .heartRate,
+        .distanceWalkingRunning,
+        .flightsClimbed
+    ]
+
+    /// Types the mapper understands. This is intentionally broader than the
+    /// current consent set so adding a future provider does not silently
+    /// weaken the value-level mapping policy.
     public static let supportedQuantityTypes: Set<AppleHealthQuantityType> = Set(
         AppleHealthQuantityType.allCases
     )
@@ -239,7 +253,7 @@ public enum AppleHealthCumulativeNormalizer {
     /// cannot survive a later Watch correction to zero or below.
     public static func exportPlan(from samples: [HealthSample]) -> AppleHealthCumulativeExportPlan {
         let cumulative = samples.filter {
-            ($0.metric == .steps || $0.metric == .distance) &&
+            ($0.metric == .steps || $0.metric == .distance || $0.metric == .floors) &&
                 $0.aggregation == .dailyCumulative
         }
         // `CALORIES_DAILY` includes basal metabolism. It remains an in-app
@@ -247,7 +261,8 @@ public enum AppleHealthCumulativeNormalizer {
         // adapter sees it; the mapper also rejects it as a second guard.
         let passthrough = samples.filter {
             $0.metric != .totalCalories &&
-                !($0.aggregation == .dailyCumulative && ($0.metric == .steps || $0.metric == .distance))
+                !($0.aggregation == .dailyCumulative &&
+                    ($0.metric == .steps || $0.metric == .distance || $0.metric == .floors))
         }
 
         let grouped = Dictionary(grouping: cumulative, by: DailySeriesKey.init)
@@ -333,8 +348,9 @@ public enum AppleHealthCumulativeNormalizer {
         switch metric {
         case .steps: .stepCount
         case .distance: .distanceWalkingRunning
+        case .floors: .flightsClimbed
         default:
-            preconditionFailure("Only cumulative step and distance samples reach this path")
+            preconditionFailure("Only cumulative step, distance and floor samples reach this path")
         }
     }
 

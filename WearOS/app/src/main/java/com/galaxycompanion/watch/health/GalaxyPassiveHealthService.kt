@@ -14,11 +14,7 @@ import androidx.health.services.client.data.DataPointContainer
 class GalaxyPassiveHealthService : PassiveListenerService() {
     override fun onNewDataPointsReceived(dataPoints: DataPointContainer) {
         try {
-            WatchHealthSampleStore(applicationContext).apply {
-                appendHeartRate(dataPoints)
-                appendPassiveDailyMetrics(dataPoints)
-                appendPassiveGranularActivity(dataPoints)
-            }
+            WatchHealthSampleStore(applicationContext).appendPassiveData(dataPoints)
         } catch (error: Exception) {
             Log.e(TAG, "Unable to persist Health Services data (${error.javaClass.simpleName})")
         }

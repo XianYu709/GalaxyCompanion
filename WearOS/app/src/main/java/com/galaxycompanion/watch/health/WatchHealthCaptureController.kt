@@ -77,6 +77,9 @@ class WatchHealthCaptureController(
                 if (canReadActivity && currentCapabilities.supportsPassiveDailyDistance) {
                     add(DataType.DISTANCE_DAILY)
                 }
+                if (canReadActivity && currentCapabilities.supportsPassiveDailyFloors) {
+                    add(DataType.FLOORS_DAILY)
+                }
                 // These deltas retain their actual interval boundaries. They
                 // are never relabelled as daily totals, and are the only
                 // activity values used by the iPhone's local sleep analysis.
@@ -85,6 +88,9 @@ class WatchHealthCaptureController(
                 }
                 if (canReadActivity && currentCapabilities.supportsPassiveGranularDistance) {
                     add(DataType.DISTANCE)
+                }
+                if (canReadActivity && currentCapabilities.supportsPassiveGranularFloors) {
+                    add(DataType.FLOORS)
                 }
             }
             val messages = mutableListOf<String>()
@@ -101,7 +107,8 @@ class WatchHealthCaptureController(
                     if (
                         currentCapabilities.supportsPassiveDailySteps ||
                         currentCapabilities.supportsPassiveDailyCalories ||
-                        currentCapabilities.supportsPassiveDailyDistance
+                        currentCapabilities.supportsPassiveDailyDistance ||
+                        currentCapabilities.supportsPassiveDailyFloors
                     ) {
                         messages += "基础日累计指标"
                     }
@@ -110,7 +117,8 @@ class WatchHealthCaptureController(
                     }
                     if (
                         currentCapabilities.supportsPassiveGranularSteps ||
-                        currentCapabilities.supportsPassiveGranularDistance
+                        currentCapabilities.supportsPassiveGranularDistance ||
+                        currentCapabilities.supportsPassiveGranularFloors
                     ) {
                         messages += "活动增量记录"
                     }
@@ -163,24 +171,31 @@ class WatchHealthCaptureController(
     }
 
     fun refreshSummary() {
-        try {
-            if (sampleStore.consumePermissionLoss()) {
-                passiveCaptureEnabled = false
-                passiveCaptureUnknown = false
-                sampleStore.setPassiveCaptureEnabled(false)
-                status = "Health Services 已撤销被动采集权限；请重新授权。"
-            } else if (sampleStore.isPassiveCaptureEnabled()) {
-                // Health Services owns this registration independently from
-                // the activity lifecycle. Do not require the person to
-                // re-enable it merely because the Watch UI restarted.
-                passiveCaptureEnabled = true
-                passiveCaptureUnknown = false
-                status = "Watch 本地健康记录已开启；Health Services 会按系统节奏分批保存，等待 iPhone 手动同步。"
+        if (closed) return
+        // Decoding a full durable queue is proportional to its size. Keep it
+        // off the first-frame path so reopening the simple Watch source does
+        // not hitch while the existing passive registration stays in place.
+        executor.execute {
+            if (closed) return@execute
+            try {
+                if (sampleStore.consumePermissionLoss()) {
+                    passiveCaptureEnabled = false
+                    passiveCaptureUnknown = false
+                    sampleStore.setPassiveCaptureEnabled(false)
+                    status = "Health Services 已撤销被动采集权限；请重新授权。"
+                } else if (sampleStore.isPassiveCaptureEnabled()) {
+                    // Health Services owns this registration independently from
+                    // the activity lifecycle. Do not require the person to
+                    // re-enable it merely because the Watch UI restarted.
+                    passiveCaptureEnabled = true
+                    passiveCaptureUnknown = false
+                    status = "Watch 本地健康记录已开启；Health Services 会按系统节奏分批保存，等待 iPhone 手动同步。"
+                }
+            } catch (error: Exception) {
+                status = "本地健康存储不可用：${error.localizedMessage ?: error.javaClass.simpleName}"
             }
-        } catch (error: Exception) {
-            status = "本地健康存储不可用：${error.localizedMessage ?: error.javaClass.simpleName}"
+            publish()
         }
-        publish()
     }
 
     fun close() {
@@ -226,6 +241,6 @@ class WatchHealthCaptureController(
     }
 
     private companion object {
-        val DAILY_METRICS = setOf("steps", "calories", "distance")
+        val DAILY_METRICS = setOf("steps", "calories", "distance", "floors")
     }
 }

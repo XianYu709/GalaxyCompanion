@@ -3,6 +3,13 @@ import XCTest
 import GalaxyCompanionProtocol
 
 final class HealthKitExportPolicyTests: XCTestCase {
+    func testCurrentAuthorizationRequestUsesOnlyCollectedSafeMetrics() {
+        XCTAssertEqual(
+            AppleHealthSampleMapper.authorizationQuantityTypes,
+            [.stepCount, .heartRate, .distanceWalkingRunning, .flightsClimbed]
+        )
+    }
+
     func testMapsOnlyExplicitlySupportedQuantitiesWithStableMetadata() throws {
         let id = UUID(uuidString: "00112233-4455-6677-8899-AABBCCDDEEFF")!
         let start = Date(timeIntervalSince1970: 1_700_000_000)
@@ -192,6 +199,40 @@ final class HealthKitExportPolicyTests: XCTestCase {
 
         XCTAssertEqual(normalized[1].value, 250)
         XCTAssertEqual(payload.metadata.syncVersion, 9)
+    }
+
+    func testNormalizesDailyFloorsBeforeHealthKitExport() throws {
+        let dayStart = Date(timeIntervalSince1970: 1_700_150_000)
+        let first = HealthSample(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000115")!,
+            metric: .floors,
+            value: 3,
+            unit: .count,
+            startTime: dayStart,
+            endTime: dayStart.addingTimeInterval(60),
+            source: .wearHealthServices,
+            quality: .measured,
+            aggregation: .dailyCumulative
+        )
+        let later = HealthSample(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000116")!,
+            metric: .floors,
+            value: 5,
+            unit: .count,
+            startTime: dayStart,
+            endTime: dayStart.addingTimeInterval(120),
+            source: .wearHealthServices,
+            quality: .measured,
+            aggregation: .dailyCumulative
+        )
+
+        let normalized = AppleHealthCumulativeNormalizer.exportableSamples(from: [later, first])
+
+        XCTAssertEqual(normalized.map(\.value), [3, 2])
+        XCTAssertEqual(
+            try XCTUnwrap(AppleHealthSampleMapper.map(normalized.last!).successValue).quantityType,
+            .flightsClimbed
+        )
     }
 
     func testCumulativeDownwardCorrectionCreatesDurableRemovalForPreviouslyExportedInterval() throws {

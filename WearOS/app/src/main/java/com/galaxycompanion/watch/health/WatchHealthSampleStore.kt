@@ -22,10 +22,18 @@ class WatchHealthSampleStore(context: Context) {
         Context.MODE_PRIVATE
     )
 
-    fun appendHeartRate(dataPoints: DataPointContainer) {
+    /**
+     * Persists one Health Services callback as one durable transaction.
+     *
+     * Passive Monitoring commonly batches several values together. Writing
+     * every point independently used to repeatedly decode and re-encode the
+     * entire private cache, which is wasteful on a small Watch battery.
+     */
+    fun appendPassiveData(dataPoints: DataPointContainer) {
         val bootInstant = bootInstant()
-        dataPoints.getData(DataType.HEART_RATE_BPM).forEach { point ->
-            append(
+        val incoming = buildList {
+            dataPoints.getData(DataType.HEART_RATE_BPM).forEach { point ->
+                add(
                 StoredWatchHealthSample(
                     id = UUID.randomUUID().toString(),
                     metric = "heartRate",
@@ -35,73 +43,56 @@ class WatchHealthSampleStore(context: Context) {
                     endTimeMillis = null,
                     aggregation = AGGREGATION_INSTANTANEOUS
                 )
-            )
-        }
-    }
-
-    fun appendPassiveDailyMetrics(dataPoints: DataPointContainer) {
-        val bootInstant = bootInstant()
-        dataPoints.getData(DataType.STEPS_DAILY).forEach { point ->
-            appendInterval(
-                "steps",
-                point.value.toDouble(),
-                "count",
-                point,
-                bootInstant,
-                AGGREGATION_DAILY_CUMULATIVE
-            )
-        }
-        dataPoints.getData(DataType.CALORIES_DAILY).forEach { point ->
+                )
+            }
+            dataPoints.getData(DataType.STEPS_DAILY).forEach { point ->
+                add(intervalSample(
+                    "steps", point.value.toDouble(), "count", point, bootInstant,
+                    AGGREGATION_DAILY_CUMULATIVE
+                ))
+            }
+            dataPoints.getData(DataType.CALORIES_DAILY).forEach { point ->
             // Health Services daily calories include BMR. Preserve that fact
             // locally instead of relabeling the value as active calories.
-            appendInterval(
-                "totalCalories",
-                point.value,
-                "kilocalories",
-                point,
-                bootInstant,
-                AGGREGATION_DAILY_CUMULATIVE
-            )
+                add(intervalSample(
+                    "totalCalories", point.value, "kilocalories", point, bootInstant,
+                    AGGREGATION_DAILY_CUMULATIVE
+                ))
+            }
+            dataPoints.getData(DataType.DISTANCE_DAILY).forEach { point ->
+                add(intervalSample(
+                    "distance", point.value, "meters", point, bootInstant,
+                    AGGREGATION_DAILY_CUMULATIVE
+                ))
+            }
+            dataPoints.getData(DataType.FLOORS_DAILY).forEach { point ->
+                add(intervalSample(
+                    "floors", point.value, "count", point, bootInstant,
+                    AGGREGATION_DAILY_CUMULATIVE
+                ))
+            }
+            // Keep deltas distinct from the preceding daily snapshots. They
+            // retain real time boundaries for local sleep analysis.
+            dataPoints.getData(DataType.STEPS).forEach { point ->
+                add(intervalSample(
+                    "steps", point.value.toDouble(), "count", point, bootInstant,
+                    AGGREGATION_INTERVAL
+                ))
+            }
+            dataPoints.getData(DataType.DISTANCE).forEach { point ->
+                add(intervalSample(
+                    "distance", point.value, "meters", point, bootInstant,
+                    AGGREGATION_INTERVAL
+                ))
+            }
+            dataPoints.getData(DataType.FLOORS).forEach { point ->
+                add(intervalSample(
+                    "floors", point.value, "count", point, bootInstant,
+                    AGGREGATION_INTERVAL
+                ))
+            }
         }
-        dataPoints.getData(DataType.DISTANCE_DAILY).forEach { point ->
-            appendInterval(
-                "distance",
-                point.value,
-                "meters",
-                point,
-                bootInstant,
-                AGGREGATION_DAILY_CUMULATIVE
-            )
-        }
-    }
-
-    /**
-     * Persists genuine Health Services deltas without collapsing them into a
-     * day total. Their interval boundaries are used on iPhone for both safe
-     * HealthKit export and conservative local sleep analysis.
-     */
-    fun appendPassiveGranularActivity(dataPoints: DataPointContainer) {
-        val bootInstant = bootInstant()
-        dataPoints.getData(DataType.STEPS).forEach { point ->
-            appendInterval(
-                "steps",
-                point.value.toDouble(),
-                "count",
-                point,
-                bootInstant,
-                AGGREGATION_INTERVAL
-            )
-        }
-        dataPoints.getData(DataType.DISTANCE).forEach { point ->
-            appendInterval(
-                "distance",
-                point.value,
-                "meters",
-                point,
-                bootInstant,
-                AGGREGATION_INTERVAL
-            )
-        }
+        appendAll(incoming)
     }
 
     fun summary(): WatchHealthStorageSummary = synchronized(LOCK) {
@@ -230,44 +221,49 @@ class WatchHealthSampleStore(context: Context) {
         }
     }
 
-    private fun appendInterval(
+    private fun intervalSample(
         metric: String,
         value: Double,
         unit: String,
         point: IntervalDataPoint<*>,
         bootInstant: Instant,
         aggregation: String
-    ) {
-        append(
-            StoredWatchHealthSample(
-                id = UUID.randomUUID().toString(),
-                metric = metric,
-                value = value,
-                unit = unit,
-                startTimeMillis = point.getStartInstant(bootInstant).toEpochMilli(),
-                endTimeMillis = point.getEndInstant(bootInstant).toEpochMilli(),
-                aggregation = aggregation
-            )
-        )
-    }
+    ): StoredWatchHealthSample = StoredWatchHealthSample(
+        id = UUID.randomUUID().toString(),
+        metric = metric,
+        value = value,
+        unit = unit,
+        startTimeMillis = point.getStartInstant(bootInstant).toEpochMilli(),
+        endTimeMillis = point.getEndInstant(bootInstant).toEpochMilli(),
+        aggregation = aggregation
+    )
 
-    private fun append(sample: StoredWatchHealthSample) {
+    private fun appendAll(incoming: List<StoredWatchHealthSample>) {
+        if (incoming.isEmpty()) return
         synchronized(LOCK) {
             val samples = load().toMutableList()
-            val matchingIndex = samples.indexOfFirst { it.hasSameIntervalAs(sample) }
-            if (matchingIndex >= 0) {
-                val existing = samples[matchingIndex]
-                if (existing.sameMeasurementAs(sample)) return@synchronized
-                // A revised interval must get a later cursor. The original
-                // sample ID is kept so phone-side storage can treat this as a
-                // correction rather than a second measurement.
-                samples[matchingIndex] = sample.copy(
-                    id = existing.id,
-                    cursor = nextSampleCursor(samples)
-                )
-            } else {
-                samples += sample.copy(cursor = nextSampleCursor(samples))
+            var nextCursor = maxOf(
+                samples.maxOfOrNull(StoredWatchHealthSample::cursor) ?: 0L,
+                preferences.getLong(NEXT_SAMPLE_CURSOR_KEY, 0L)
+            )
+            var changed = false
+            incoming.forEach { sample ->
+                val matchingIndex = samples.indexOfFirst { it.hasSameIntervalAs(sample) }
+                if (matchingIndex >= 0) {
+                    val existing = samples[matchingIndex]
+                    if (existing.sameMeasurementAs(sample)) return@forEach
+                    nextCursor = nextCursor.incrementCursor()
+                    // A revised interval gets a later cursor but retains its
+                    // stable id so iPhone can replace its local copy.
+                    samples[matchingIndex] = sample.copy(id = existing.id, cursor = nextCursor)
+                } else {
+                    nextCursor = nextCursor.incrementCursor()
+                    samples += sample.copy(cursor = nextCursor)
+                }
+                changed = true
             }
+            if (!changed) return@synchronized
+
             val existingEvictionWatermark = preferences
                 .getLong(EVICTED_THROUGH_CURSOR_KEY, 0L)
                 .coerceAtLeast(0L)
@@ -276,17 +272,16 @@ class WatchHealthSampleStore(context: Context) {
                 maximumRetainedSamples = MAX_RETAINED_SAMPLES,
                 previousEvictedThroughCursor = existingEvictionWatermark
             )
-            // commit() is intentional for a callback-delivered health record: the
-            // operating system may unbind the passive service after this method.
+            // commit() is intentional for a callback-delivered health record:
+            // the OS may unbind the passive service immediately afterwards.
+            // All values for this callback are committed together.
             check(
                 preferences.edit()
-                    .putString(
-                        SAMPLES_KEY,
-                        encode(retention.retained)
-                    )
+                    .putString(SAMPLES_KEY, encode(retention.retained))
                     .putLong(EVICTED_THROUGH_CURSOR_KEY, retention.evictedThroughCursor)
+                    .putLong(NEXT_SAMPLE_CURSOR_KEY, nextCursor)
                     .commit()
-            ) { "Unable to persist Health Services sample" }
+            ) { "Unable to persist Health Services sample batch" }
         }
     }
 
@@ -340,17 +335,6 @@ class WatchHealthSampleStore(context: Context) {
             )
         }
     }.toString()
-
-    private fun nextSampleCursor(samples: List<StoredWatchHealthSample>): Long {
-        val highestStored = samples.maxOfOrNull(StoredWatchHealthSample::cursor) ?: 0L
-        val highestPersisted = preferences.getLong(NEXT_SAMPLE_CURSOR_KEY, 0L)
-        val next = maxOf(highestStored, highestPersisted) + 1L
-        check(next > 0L) { "Health sample cursor overflow" }
-        check(preferences.edit().putLong(NEXT_SAMPLE_CURSOR_KEY, next).commit()) {
-            "Unable to persist Health Services sample cursor"
-        }
-        return next
-    }
 
     private fun nextBatchSequence(samples: List<StoredWatchHealthSample>): Long {
         val baseline = maxOf(
@@ -423,10 +407,7 @@ data class StoredWatchHealthSample(
             aggregation == other.aggregation
 
     fun toWireJson(): JSONObject {
-        val metricForProtocol = when (metric) {
-            "heartRate", "steps", "distance", "totalCalories" -> metric
-            else -> throw IllegalStateException("Unsupported stored health metric: $metric")
-        }
+        val metricForProtocol = protocolMetric()
         val unitForProtocol = when (unit) {
             "beatsPerMinute", "count", "meters", "kilocalories" -> unit
             else -> throw IllegalStateException("Unsupported stored health unit: $unit")
@@ -447,6 +428,16 @@ data class StoredWatchHealthSample(
             .put("revision", cursor)
             .put("aggregation", aggregationForProtocol)
     }
+
+    internal fun protocolMetric(): String = when (metric) {
+        "heartRate", "steps", "distance", "totalCalories", "floors" -> metric
+        else -> throw IllegalStateException("Unsupported stored health metric: $metric")
+    }
+}
+
+private fun Long.incrementCursor(): Long {
+    check(this < Long.MAX_VALUE) { "Health sample cursor overflow" }
+    return this + 1L
 }
 
 data class WatchHealthStorageSummary(

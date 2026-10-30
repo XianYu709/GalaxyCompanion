@@ -68,7 +68,7 @@ enum HealthKitAuthorizationState: Equatable {
         case .unavailable(let reason), .failed(let reason):
             reason
         case .needsAuthorization:
-            "仅请求写入步数、心率、活动能量、距离、楼层、血氧和经验证的体温。"
+            "当前仅请求写入步数、心率和距离。日总能量保留在本应用。"
         case .authorized:
             "授权不等于已经写入；真实手表数据仍受认证配对和实机 PoC 的安全门控。"
         case .partiallyAuthorized(let authorized, let unavailable):
@@ -247,10 +247,10 @@ final class HealthKitExportService {
 
         do {
             let requestStatus = try await store.authorizationRequestStatus(
-                for: AppleHealthSampleMapper.supportedQuantityTypes
+                for: AppleHealthSampleMapper.authorizationQuantityTypes
             )
             let statusCounts = sharingStatusCounts()
-            let total = AppleHealthSampleMapper.supportedQuantityTypes.count
+            let total = AppleHealthSampleMapper.authorizationQuantityTypes.count
 
             if statusCounts.authorized == total {
                 return .authorized
@@ -285,7 +285,7 @@ final class HealthKitExportService {
             // not that every type was granted. Always re-read per-type share
             // status before reporting success or attempting a write.
             try await store.requestAuthorization(
-                toShare: AppleHealthSampleMapper.supportedQuantityTypes
+                toShare: AppleHealthSampleMapper.authorizationQuantityTypes
             )
             return await refreshAuthorization()
         } catch {
@@ -394,7 +394,7 @@ final class HealthKitExportService {
     }
 
     private func sharingStatusCounts() -> (authorized: Int, denied: Int) {
-        AppleHealthSampleMapper.supportedQuantityTypes.reduce(into: (authorized: 0, denied: 0)) {
+        AppleHealthSampleMapper.authorizationQuantityTypes.reduce(into: (authorized: 0, denied: 0)) {
             counts,
             type in
             switch store.sharingAuthorizationStatus(for: type) {
